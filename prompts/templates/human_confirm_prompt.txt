@@ -1,0 +1,21 @@
+## 需要人工确认的危险操作
+
+Agent 计划执行以下危险操作，需要您的授权：
+
+### 操作详情
+- **操作类型**: {operation_type}
+- **目标主机**: {target_host}
+- **具体操作**: {operation_detail}
+- **操作原因**: {operation_reason}
+- **预期影响**: {expected_impact}
+- **风险评估**: {risk_assessment}
+
+### 当前故障背景
+{fault_context}
+
+请在 {timeout} 秒内通过以下方式确认或拒绝此操作：
+- **确认执行**: 回复 APPROVE
+- **拒绝执行**: 回复 REJECT
+- **修改后执行**: 回复 MODIFY:<修改说明>
+
+等待您的确认...
