@@ -1,18 +1,22 @@
 """
-恢复 Agent - 专注故障处理与自愈操作
+恢复 Subagent - 故障恢复操作执行
 
-职责：
-- 按照分析 Agent 制定的方案执行恢复操作
-- 包含危险操作（service_restart），必须经人工确认
-- 将有效的处理经验存入长期记忆
+Subagent 设计要点：
+- 编译后的 Agent 实例按 console_confirm_mode 分别缓存（最多 2 个实例）
+  True  → 控制台交互确认（开发/测试环境）
+  False → 外部 Webhook 确认（生产 API 模式）
+- Prompt 从 agents/prompts/recovery_agent.txt 加载，便于维护
+- HumanConfirmMiddleware 在危险工具调用前自动触发人工确认
+- AuditLogMiddleware 不绑定静态 fault_id，由 RunnableConfig.configurable 动态注入
 
-使用工具：service_restart（危险）、store_knowledge
+使用工具：restart_service（⚠️危险）、store_knowledge（安全）
 """
 import logging
+from pathlib import Path
 from typing import Any, Dict
 
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -24,60 +28,49 @@ from tools.knowledge_store import StoreKnowledgeTool
 
 logger = logging.getLogger(__name__)
 
-# 恢复 Agent 工具集（含危险工具，需人工确认）
+# 恢复 Subagent 工具集（含危险工具，需人工确认中间件把关）
 RECOVERY_TOOLS = [
     ServiceRestartTool(),
     StoreKnowledgeTool(),
 ]
 
-_SYSTEM_PROMPT = """你是专业的 WeOps 恢复 Agent，负责执行故障恢复操作。
-
-## 你的职责
-1. **执行恢复**：按照恢复方案逐步执行操作
-2. **危险操作确认**：重启服务等危险操作会自动触发人工确认，等待授权后再执行
-3. **存储经验**：故障成功恢复后，将有效经验存入知识库
-
-## 执行原则
-- 按优先级从高到低执行恢复方案
-- 每步操作后评估是否达到预期效果
-- 若当前步骤无效，继续下一步
-- 所有操作完成后，给出明确的恢复状态结论
-
-## 输出格式
-请按以下结构输出：
-
-### 执行操作
-[逐一列出已执行的操作和结果]
-
-### 恢复状态
-[RESOLVED：故障已恢复 | PARTIAL：部分恢复 | FAILED：未能恢复]
-
-### 后续建议
-[如未完全恢复，给出下一步建议]"""
+# ===== 单例缓存（按 console_confirm_mode 分别缓存）=====
+# console_confirm_mode=True  → 开发/测试环境，控制台交互确认
+# console_confirm_mode=False → 生产环境，外部 API/Webhook 确认
+_agent_cache: Dict[bool, Any] = {}
 
 
-def create_recovery_agent(
-    fault_id: str = None,
-    console_confirm_mode: bool = True,
-):
+def _load_prompt() -> str:
+    """从 agents/prompts/recovery_agent.txt 加载 System Prompt"""
+    prompt_path = Path(__file__).parent / "prompts" / "recovery_agent.txt"
+    return prompt_path.read_text(encoding="utf-8").strip()
+
+
+def _get_agent(console_confirm_mode: bool = True) -> Any:
     """
-    创建恢复 Agent
+    获取 Recovery Subagent 编译实例（进程级单例，按确认模式分别缓存）
 
-    Args:
-        fault_id: 故障 ID（用于审计日志）
-        console_confirm_mode: 危险操作是否使用控制台确认
+    console_confirm_mode 影响 HumanConfirmMiddleware 的行为，
+    因此不同模式需要各自独立的编译实例。
+    fault_id 通过 RunnableConfig.configurable["fault_id"] 在调用时动态注入。
     """
-    return create_agent(
-        model=get_llm(),
-        tools=RECOVERY_TOOLS,
-        system_prompt=_SYSTEM_PROMPT,
-        middleware=[
-            AuditLogMiddleware(fault_id=fault_id),
-            HumanConfirmMiddleware(console_mode=console_confirm_mode),
-        ],
-        checkpointer=InMemorySaver(),
-        name="recovery_agent",
-    )
+    if console_confirm_mode not in _agent_cache:
+        logger.info(
+            f"[RecoveryAgent] 编译 Recovery Subagent "
+            f"console_confirm_mode={console_confirm_mode}（首次初始化）"
+        )
+        _agent_cache[console_confirm_mode] = create_agent(
+            model=get_llm(),
+            tools=RECOVERY_TOOLS,
+            system_prompt=_load_prompt(),
+            middleware=[
+                AuditLogMiddleware(),                            # fault_id 由运行时动态注入
+                HumanConfirmMiddleware(console_mode=console_confirm_mode),
+            ],
+            checkpointer=InMemorySaver(),
+            name="recovery_agent",
+        )
+    return _agent_cache[console_confirm_mode]
 
 
 def run_recovery_node(
@@ -86,10 +79,9 @@ def run_recovery_node(
     console_confirm_mode: bool = True,
 ) -> Dict[str, Any]:
     """
-    恢复节点执行函数（LangGraph 节点）
+    恢复节点（LangGraph 节点函数）
 
-    读取 analysis_result 和 recovery_plan，
-    调用恢复 Agent 执行恢复操作，
+    读取 analysis_result 和 recovery_plan，调用 Recovery Subagent 执行恢复操作，
     将结果写回 state["recovery_actions"] 和 state["is_resolved"]。
     """
     fault_id = state.get("fault_id", "UNKNOWN")
@@ -120,21 +112,20 @@ def run_recovery_node(
 3. 最后给出明确的恢复状态结论（RESOLVED/PARTIAL/FAILED）"""
 
     try:
-        agent = create_recovery_agent(
-            fault_id=fault_id,
-            console_confirm_mode=console_confirm_mode,
-        )
+        agent = _get_agent(console_confirm_mode)
         result = agent.invoke(
             {"messages": [HumanMessage(content=prompt)]},
             config=RunnableConfig(
-                configurable={"thread_id": f"{fault_id}-recovery"},
+                configurable={
+                    "thread_id": f"{fault_id}-recovery",
+                    "fault_id": fault_id,   # 供 AuditLogMiddleware 动态读取
+                },
             ),
         )
         messages = result.get("messages", [])
         recovery_text = _extract_last_text(messages)
-
-        # 判断是否已恢复
         is_resolved = _check_resolved(recovery_text)
+
         logger.info(
             f"[RecoveryAgent] 恢复完成 fault_id={fault_id} is_resolved={is_resolved}"
         )
@@ -163,13 +154,16 @@ def run_recovery_node(
 
 
 def _extract_last_text(messages) -> str:
-    from langchain_core.messages import AIMessage
+    """从消息列表提取最后一条 AI 文本响应"""
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.content:
             if isinstance(msg.content, str):
                 return msg.content
             elif isinstance(msg.content, list):
-                texts = [p.get("text", "") for p in msg.content if isinstance(p, dict) and p.get("type") == "text"]
+                texts = [
+                    p.get("text", "") for p in msg.content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
                 return "\n".join(texts)
     return "（恢复 Agent 未返回有效结果）"
 
@@ -178,11 +172,8 @@ def _check_resolved(recovery_text: str) -> bool:
     """从恢复 Agent 输出文本中判断故障是否已恢复"""
     text_lower = recovery_text.lower()
     resolved_keywords = ["resolved", "已恢复", "恢复成功", "故障已消除", "服务正常"]
-    failed_keywords = ["failed", "未能恢复", "恢复失败", "仍然异常", "partial"]
-
     for kw in resolved_keywords:
         if kw in text_lower:
-            # 检查是否被否定词否定
             if "未" + kw not in text_lower and "没有" + kw not in text_lower:
                 return True
     return False

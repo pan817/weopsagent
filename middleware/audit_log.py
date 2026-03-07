@@ -69,8 +69,10 @@ class AuditLogMiddleware(AgentMiddleware):
     def __init__(self, fault_id: Optional[str] = None):
         """
         Args:
-            fault_id: 关联的故障 ID，注入到所有日志记录中
+            fault_id: 关联的故障 ID，注入到所有日志记录中。
+                      不提供时，运行时会尝试从 RunnableConfig.configurable["fault_id"] 读取。
         """
+        self._init_fault_id = fault_id  # 构造时传入的静态 fault_id
         self.fault_id = fault_id or "UNKNOWN"
         self._agent_start_time: Optional[float] = None
         self._model_call_count: int = 0
@@ -87,6 +89,18 @@ class AuditLogMiddleware(AgentMiddleware):
         """Agent 循环开始 - 记录故障处理启动"""
         self._agent_start_time = time.time()
         self._model_call_count = 0
+
+        # 若构造时未传 fault_id，尝试从 RunnableConfig.configurable 读取
+        # 支持 Subagent 模式下的单例 Agent 复用（不同调用传不同 fault_id）
+        if not self._init_fault_id:
+            try:
+                config = getattr(runtime, "config", None)
+                configurable = getattr(config, "configurable", None) or {}
+                runtime_fault_id = configurable.get("fault_id")
+                if runtime_fault_id:
+                    self.fault_id = runtime_fault_id
+            except Exception:
+                pass
 
         messages = getattr(state, "messages", []) or []
         last_msg_preview = ""

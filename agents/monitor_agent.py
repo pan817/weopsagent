@@ -1,19 +1,20 @@
 """
-监控 Agent - 专注全链路状态数据采集
+监控 Subagent - 全链路状态数据采集
 
-职责：
-- 调用 5 个监控工具收集基础设施数据
-- 汇总进程、Redis、MQ、数据库、日志的监控结果
-- 只生产监控数据，不做故障分析
+Subagent 设计要点：
+- 编译后的 Agent 实例在进程生命周期内缓存复用，不在每次调用时重建
+- Prompt 从 agents/prompts/monitor_agent.txt 加载，便于维护
+- AuditLogMiddleware 不绑定静态 fault_id，由 RunnableConfig.configurable 动态注入
+- 工具集仅含只读监控工具，无任何危险操作
 
-使用工具：
-  process_monitor, redis_monitor, mq_monitor, db_monitor, log_analyzer
+使用工具：monitor_process / analyze_logs / monitor_redis / monitor_mq / monitor_database
 """
 import logging
+from pathlib import Path
 from typing import Any, Dict
 
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -27,7 +28,7 @@ from tools.log_analyzer import LogAnalyzerTool
 
 logger = logging.getLogger(__name__)
 
-# 监控 Agent 专用工具集（只含采集类工具，无危险操作）
+# 监控 Subagent 专用工具集（只含采集类工具，无危险操作）
 MONITOR_TOOLS = [
     ProcessMonitorTool(),
     RedisMonitorTool(),
@@ -36,40 +37,44 @@ MONITOR_TOOLS = [
     LogAnalyzerTool(),
 ]
 
-_SYSTEM_PROMPT = """你是专业的 WeOps 监控 Agent，负责采集服务全链路的运行状态数据。
-
-## 你的职责
-对以下中间件逐一进行状态监控，收集原始数据（不做故障分析）：
-1. **应用进程**：检查进程是否存在、CPU/内存使用率
-2. **Redis**：连接数、内存使用、命中率、慢操作
-3. **消息队列（MQ）**：队列积压量、消费者数量、死信情况
-4. **数据库**：连接池状态、慢查询、锁等待
-5. **应用日志**：最近错误日志、异常统计
-
-## 输出要求
-- 逐一调用工具，不要跳过任何中间件
-- 以结构化方式输出各工具的监控结果
-- 标注哪些指标异常（如连接数满、错误率高、进程不存在）
-- 最后输出一份简洁的全链路监控摘要"""
+# ===== 单例缓存 =====
+_agent: Any = None
 
 
-def create_monitor_agent(fault_id: str = None):
-    """创建监控 Agent"""
-    return create_agent(
-        model=get_llm(),
-        tools=MONITOR_TOOLS,
-        system_prompt=_SYSTEM_PROMPT,
-        middleware=[AuditLogMiddleware(fault_id=fault_id)],
-        checkpointer=InMemorySaver(),
-        name="monitor_agent",
-    )
+def _load_prompt() -> str:
+    """从 agents/prompts/monitor_agent.txt 加载 System Prompt"""
+    prompt_path = Path(__file__).parent / "prompts" / "monitor_agent.txt"
+    return prompt_path.read_text(encoding="utf-8").strip()
+
+
+def _get_agent() -> Any:
+    """
+    获取 Monitor Subagent 编译实例（进程级单例）
+
+    Agent 只在首次调用时编译，后续调用复用同一实例。
+    fault_id 通过 RunnableConfig.configurable["fault_id"] 在调用时动态注入，
+    无需重建 Agent 即可支持多个并发故障处理。
+    """
+    global _agent
+    if _agent is None:
+        logger.info("[MonitorAgent] 编译 Monitor Subagent（首次初始化）")
+        _agent = create_agent(
+            model=get_llm(),
+            tools=MONITOR_TOOLS,
+            system_prompt=_load_prompt(),
+            # AuditLogMiddleware 不绑定 fault_id，由运行时从 configurable 读取
+            middleware=[AuditLogMiddleware()],
+            checkpointer=InMemorySaver(),
+            name="monitor_agent",
+        )
+    return _agent
 
 
 def run_monitor_node(state: Dict[str, Any], config: RunnableConfig) -> Dict[str, Any]:
     """
-    监控节点执行函数（LangGraph 节点）
+    监控节点（LangGraph 节点函数）
 
-    读取 state 中的服务信息，调用监控 Agent 采集数据，
+    从 FaultState 读取服务信息，调用 Monitor Subagent 采集全链路状态，
     将结果写回 state["monitoring_results"]。
     """
     fault_id = state.get("fault_id", "UNKNOWN")
@@ -86,21 +91,23 @@ def run_monitor_node(state: Dict[str, Any], config: RunnableConfig) -> Dict[str,
     )
 
     try:
-        agent = create_monitor_agent(fault_id=fault_id)
+        agent = _get_agent()
         result = agent.invoke(
             {"messages": [HumanMessage(content=prompt)]},
             config=RunnableConfig(
-                configurable={"thread_id": f"{fault_id}-monitor"},
+                configurable={
+                    "thread_id": f"{fault_id}-monitor",
+                    "fault_id": fault_id,   # 供 AuditLogMiddleware 动态读取
+                },
             ),
         )
-        # 提取监控摘要
         messages = result.get("messages", [])
         monitoring_results = _extract_last_text(messages)
         logger.info(f"[MonitorAgent] 监控完成 fault_id={fault_id}")
 
         return {
             "monitoring_results": monitoring_results,
-            "messages": messages[-2:] if len(messages) >= 2 else messages,  # 只追加最后的 AI 摘要
+            "messages": messages[-2:] if len(messages) >= 2 else messages,
         }
     except Exception as e:
         logger.error(f"[MonitorAgent] 监控失败 fault_id={fault_id}: {e}")
@@ -112,12 +119,14 @@ def run_monitor_node(state: Dict[str, Any], config: RunnableConfig) -> Dict[str,
 
 def _extract_last_text(messages) -> str:
     """从消息列表提取最后一条 AI 文本响应"""
-    from langchain_core.messages import AIMessage
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.content:
             if isinstance(msg.content, str):
                 return msg.content
             elif isinstance(msg.content, list):
-                texts = [p.get("text", "") for p in msg.content if isinstance(p, dict) and p.get("type") == "text"]
+                texts = [
+                    p.get("text", "") for p in msg.content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
                 return "\n".join(texts)
     return "（监控 Agent 未返回有效结果）"

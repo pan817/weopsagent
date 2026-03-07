@@ -1,20 +1,21 @@
 """
-分析 Agent - 专注故障根因分析
+分析 Subagent - 故障根因分析与恢复方案制定
 
-职责：
-- 综合监控数据 + 知识库内容进行根因分析
-- 制定恢复方案
-- 不调用任何工具（纯 LLM 推理）
+Subagent 设计要点：
+- 编译后的 Agent 实例在进程生命周期内缓存复用，不在每次调用时重建
+- Prompt 从 agents/prompts/analysis_agent.txt 加载，便于维护
+- 不绑定任何工具（纯 LLM 推理），监控数据和知识库内容已通过 FaultState 传入
+- 通过 Prompt 引导 LLM 输出结构化 Markdown，便于下游 RecoveryAgent 解析
 
-上下文来源（均从 state 传入，无需工具调用）：
-  monitoring_results（监控摘要）、knowledge_context（RAG 检索结果）、
-  service_node_info（服务拓扑）、fault_description（故障描述）
+无工具：所有分析基于 FaultState 中的 monitoring_results + knowledge_context 进行
 """
 import logging
+import re
+from pathlib import Path
 from typing import Any, Dict
 
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -23,55 +24,43 @@ from middleware.audit_log import AuditLogMiddleware
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """你是专业的 WeOps 分析 Agent，负责对故障进行根因分析并制定恢复方案。
-
-## 你的输入
-你会收到以下信息（均已整理好，无需调用工具）：
-1. 故障描述：用户上报的原始告警内容
-2. 全链路监控摘要：各中间件的运行状态数据
-3. 知识库参考：通用处理方案、场景处理方案、历史故障案例
-
-## 你的职责
-1. **根因分析**：基于监控数据，定位故障的直接原因和根本原因
-2. **影响评估**：评估故障影响范围和严重程度
-3. **方案制定**：给出具体可执行的恢复方案（按优先级排序）
-4. **方案说明**：说明每个操作步骤的目的和预期效果
-
-## 输出格式
-请按以下结构输出：
-
-### 根因分析
-[直接原因和根本原因的详细描述]
-
-### 影响评估
-[故障影响范围、严重程度、受影响用户估算]
-
-### 恢复方案
-1. [步骤1]（优先级：高/中/低，预期效果：xxx）
-2. [步骤2]...
-
-### 注意事项
-[执行方案时需要注意的风险和操作前提]"""
+# ===== 单例缓存 =====
+_agent: Any = None
 
 
-def create_analysis_agent(fault_id: str = None):
-    """创建分析 Agent（不绑定任何工具，纯 LLM 推理）"""
-    return create_agent(
-        model=get_llm(),
-        tools=[],   # 分析 Agent 不需要任何工具
-        system_prompt=_SYSTEM_PROMPT,
-        middleware=[AuditLogMiddleware(fault_id=fault_id)],
-        checkpointer=InMemorySaver(),
-        name="analysis_agent",
-    )
+def _load_prompt() -> str:
+    """从 agents/prompts/analysis_agent.txt 加载 System Prompt"""
+    prompt_path = Path(__file__).parent / "prompts" / "analysis_agent.txt"
+    return prompt_path.read_text(encoding="utf-8").strip()
+
+
+def _get_agent() -> Any:
+    """
+    获取 Analysis Subagent 编译实例（进程级单例）
+
+    分析 Agent 无工具，纯 LLM 推理，编译开销最小。
+    fault_id 通过 RunnableConfig.configurable["fault_id"] 在调用时动态注入。
+    """
+    global _agent
+    if _agent is None:
+        logger.info("[AnalysisAgent] 编译 Analysis Subagent（首次初始化）")
+        _agent = create_agent(
+            model=get_llm(),
+            tools=[],   # 分析 Agent 不需要任何工具，纯 LLM 推理
+            system_prompt=_load_prompt(),
+            middleware=[AuditLogMiddleware()],
+            checkpointer=InMemorySaver(),
+            name="analysis_agent",
+        )
+    return _agent
 
 
 def run_analysis_node(state: Dict[str, Any], config: RunnableConfig) -> Dict[str, Any]:
     """
-    分析节点执行函数（LangGraph 节点）
+    分析节点（LangGraph 节点函数）
 
-    读取 monitoring_results 和 knowledge_context，
-    调用分析 Agent 输出 analysis_result、root_cause、recovery_plan。
+    读取 monitoring_results、knowledge_context、service_node_info，
+    调用 Analysis Subagent 输出 analysis_result、root_cause、recovery_plan。
     """
     fault_id = state.get("fault_id", "UNKNOWN")
     fault_description = state.get("fault_description", "")
@@ -96,17 +85,19 @@ def run_analysis_node(state: Dict[str, Any], config: RunnableConfig) -> Dict[str
 请基于以上信息进行完整的根因分析，并给出恢复方案。"""
 
     try:
-        agent = create_analysis_agent(fault_id=fault_id)
+        agent = _get_agent()
         result = agent.invoke(
             {"messages": [HumanMessage(content=prompt)]},
             config=RunnableConfig(
-                configurable={"thread_id": f"{fault_id}-analysis"},
+                configurable={
+                    "thread_id": f"{fault_id}-analysis",
+                    "fault_id": fault_id,   # 供 AuditLogMiddleware 动态读取
+                },
             ),
         )
         messages = result.get("messages", [])
         analysis_text = _extract_last_text(messages)
 
-        # 从分析结果中解析出根因和方案（简单分段提取）
         root_cause = _extract_section(analysis_text, "根因分析")
         recovery_plan = _extract_section(analysis_text, "恢复方案")
 
@@ -129,21 +120,22 @@ def run_analysis_node(state: Dict[str, Any], config: RunnableConfig) -> Dict[str
 
 
 def _extract_last_text(messages) -> str:
-    from langchain_core.messages import AIMessage
+    """从消息列表提取最后一条 AI 文本响应"""
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.content:
             if isinstance(msg.content, str):
                 return msg.content
             elif isinstance(msg.content, list):
-                texts = [p.get("text", "") for p in msg.content if isinstance(p, dict) and p.get("type") == "text"]
+                texts = [
+                    p.get("text", "") for p in msg.content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
                 return "\n".join(texts)
     return "（分析 Agent 未返回有效结果）"
 
 
 def _extract_section(text: str, section_name: str) -> str:
-    """从 Markdown 格式文本中提取指定小节内容"""
-    import re
-    # 匹配 ### 节标题
+    """从 Markdown 格式文本中提取指定 ### 小节的内容"""
     pattern = rf"###\s*{section_name}\s*\n(.*?)(?=###|\Z)"
     match = re.search(pattern, text, re.DOTALL)
     if match:
