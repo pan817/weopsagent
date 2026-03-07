@@ -408,5 +408,199 @@ class TestAPIServer:
         assert data["approved"] is True
 
 
+class TestMultiAgentFaultAgent:
+    """多 Agent 架构 FaultAgent 集成测试"""
+
+    @patch("agents.fault_agent.get_fault_graph")
+    @patch("agents.fault_agent.get_long_term_memory")
+    @patch("agents.fault_agent.get_short_term_memory")
+    @patch("agents.fault_agent.FaultPlanner")
+    def test_handle_fault_resolved(
+        self,
+        mock_planner_class,
+        mock_stm,
+        mock_ltm,
+        mock_get_graph,
+    ):
+        """测试多 Agent 流程：故障成功恢复"""
+        from agents.fault_agent import FaultAgent
+        from planner.fault_planner import AlertType
+
+        mock_plan = MagicMock()
+        mock_plan.fault_id = "FAULT-MA-001"
+        mock_plan.service_name = "order-service"
+        mock_plan.alert_type = AlertType.API_SLOW
+        mock_plan.raw_service_info = "订单服务 192.168.1.101"
+        mock_plan.knowledge_query = "订单服务响应慢"
+        mock_planner_class.return_value.create_plan.return_value = mock_plan
+
+        mock_stm.return_value.get_messages.return_value = []
+        mock_ltm.return_value.load_knowledge_base.return_value = {"general": 3}
+        mock_ltm.return_value.format_context.return_value = "相关知识：数据库慢查询处理"
+
+        mock_graph = MagicMock()
+        mock_graph.invoke.return_value = {
+            "fault_id": "FAULT-MA-001",
+            "service_name": "order-service",
+            "is_resolved": True,
+            "root_cause": "数据库连接池耗尽",
+            "recovery_actions": "已扩容连接池至 200",
+            "notifications_sent": True,
+            "error_message": None,
+            "analysis_result": "连接池耗尽导致响应超时",
+            "messages": [],
+        }
+        mock_get_graph.return_value = mock_graph
+
+        agent = FaultAgent()
+        result = agent.handle_fault("订单服务接口超时，P99 超过 5 秒")
+
+        assert result["status"] == "resolved"
+        assert result["is_resolved"] is True
+        assert result["notifications_sent"] is True
+        assert "fault_id" in result
+        assert "response" in result
+
+    @patch("agents.fault_agent.get_fault_graph")
+    @patch("agents.fault_agent.get_long_term_memory")
+    @patch("agents.fault_agent.get_short_term_memory")
+    @patch("agents.fault_agent.FaultPlanner")
+    def test_handle_fault_not_resolved(
+        self,
+        mock_planner_class,
+        mock_stm,
+        mock_ltm,
+        mock_get_graph,
+    ):
+        """测试多 Agent 流程：故障未能完全恢复（验证次数耗尽）"""
+        from agents.fault_agent import FaultAgent
+        from planner.fault_planner import AlertType
+
+        mock_plan = MagicMock()
+        mock_plan.fault_id = "FAULT-MA-002"
+        mock_plan.service_name = "payment-service"
+        mock_plan.alert_type = AlertType.SERVICE_DOWN
+        mock_plan.raw_service_info = ""
+        mock_plan.knowledge_query = "支付服务宕机"
+        mock_planner_class.return_value.create_plan.return_value = mock_plan
+
+        mock_stm.return_value.get_messages.return_value = []
+        mock_ltm.return_value.load_knowledge_base.return_value = {}
+        mock_ltm.return_value.format_context.return_value = ""
+
+        mock_graph = MagicMock()
+        mock_graph.invoke.return_value = {
+            "fault_id": "FAULT-MA-002",
+            "service_name": "payment-service",
+            "is_resolved": False,
+            "root_cause": "硬件故障，需人工介入",
+            "recovery_actions": "已尝试重启，未成功",
+            "notifications_sent": True,
+            "error_message": None,
+            "analysis_result": "",
+            "messages": [],
+        }
+        mock_get_graph.return_value = mock_graph
+
+        agent = FaultAgent()
+        result = agent.handle_fault("支付服务宕机，无法连接")
+
+        assert result["status"] == "completed"
+        assert result["is_resolved"] is False
+        assert result["service_name"] == "payment-service"
+
+    @patch("agents.fault_agent.get_fault_graph")
+    @patch("agents.fault_agent.get_long_term_memory")
+    @patch("agents.fault_agent.get_short_term_memory")
+    @patch("agents.fault_agent.FaultPlanner")
+    def test_handle_fault_graph_exception(
+        self,
+        mock_planner_class,
+        mock_stm,
+        mock_ltm,
+        mock_get_graph,
+    ):
+        """测试 StateGraph 执行异常时的错误处理"""
+        from agents.fault_agent import FaultAgent
+        from planner.fault_planner import AlertType
+
+        mock_plan = MagicMock()
+        mock_plan.fault_id = "FAULT-MA-003"
+        mock_plan.service_name = "unknown"
+        mock_plan.alert_type = AlertType.UNKNOWN
+        mock_plan.raw_service_info = ""
+        mock_plan.knowledge_query = ""
+        mock_planner_class.return_value.create_plan.return_value = mock_plan
+
+        mock_stm.return_value.get_messages.return_value = []
+        mock_ltm.return_value.load_knowledge_base.return_value = {}
+        mock_ltm.return_value.format_context.return_value = ""
+
+        mock_graph = MagicMock()
+        mock_graph.invoke.side_effect = RuntimeError("LangGraph 执行失败")
+        mock_get_graph.return_value = mock_graph
+
+        agent = FaultAgent()
+        result = agent.handle_fault("未知故障")
+
+        assert result["status"] == "error"
+        assert "error" in result
+
+
+class TestCoordinator:
+    """Coordinator StateGraph 路由逻辑测试"""
+
+    def test_route_after_recovery_resolved(self):
+        """测试恢复后路由：已解决 → notify_node"""
+        from agents.coordinator import _route_after_recovery
+        state = {"is_resolved": True, "verify_count": 0}
+        assert _route_after_recovery(state) == "notify_node"
+
+    def test_route_after_recovery_retry(self):
+        """测试恢复后路由：未解决且未超限 → monitor_node"""
+        from agents.coordinator import _route_after_recovery
+        state = {"is_resolved": False, "verify_count": 0}
+        assert _route_after_recovery(state) == "monitor_node"
+
+    def test_route_after_recovery_max_exceeded(self):
+        """测试恢复后路由：超出验证上限 → notify_node（强制通知）"""
+        from agents.coordinator import _route_after_recovery, MAX_VERIFY_COUNT
+        state = {"is_resolved": False, "verify_count": MAX_VERIFY_COUNT}
+        assert _route_after_recovery(state) == "notify_node"
+
+    def test_increment_verify_count(self):
+        """测试验证计数器递增"""
+        from agents.coordinator import _increment_verify_count
+        state = {"verify_count": 1}
+        result = _increment_verify_count(state)
+        assert result["verify_count"] == 2
+
+    def test_increment_verify_count_initial(self):
+        """测试验证计数器从空状态开始递增"""
+        from agents.coordinator import _increment_verify_count
+        state = {}
+        result = _increment_verify_count(state)
+        assert result["verify_count"] == 1
+
+    def test_build_fault_graph_returns_compiled_graph(self):
+        """测试 build_fault_graph 返回可调用的编译图"""
+        from agents.coordinator import build_fault_graph
+        graph = build_fault_graph(console_confirm_mode=True)
+        assert graph is not None
+        assert callable(graph.invoke)
+
+    def test_get_fault_graph_caches_instance(self):
+        """测试 get_fault_graph 对相同参数返回同一缓存实例"""
+        from agents.coordinator import get_fault_graph, _graph_cache
+        _graph_cache.clear()
+
+        g1 = get_fault_graph(console_confirm_mode=True)
+        g2 = get_fault_graph(console_confirm_mode=True)
+        assert g1 is g2
+
+        g3 = get_fault_graph(console_confirm_mode=False)
+        assert g3 is not g1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -97,7 +97,7 @@ def get_fault_agent():
     """获取全局 FaultAgent 单例（懒加载）"""
     global _fault_agent
     if _fault_agent is None:
-        from agent.fault_agent import FaultAgent
+        from agents.fault_agent import FaultAgent
         _fault_agent = FaultAgent(
             console_confirm_mode=False,  # 生产环境使用 API 确认模式
             enable_audit_log=True,

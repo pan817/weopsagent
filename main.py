@@ -38,7 +38,7 @@ def cmd_serve(args):
 def cmd_handle(args):
     """命令行模式直接处理故障"""
     import json
-    from agent.fault_agent import FaultAgent
+    from agents.fault_agent import FaultAgent
 
     logger.info("初始化 FaultAgent...")
     agent = FaultAgent(
