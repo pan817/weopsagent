@@ -20,11 +20,11 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from llm.model import get_llm
 from middleware.audit_log import AuditLogMiddleware
-from tools.notification import NotificationTool
+from tools import get_tool_registry
 
 logger = logging.getLogger(__name__)
 
-NOTIFY_TOOLS = [NotificationTool()]
+NOTIFY_TOOLS = get_tool_registry().get_group("notification")
 
 # ===== 单例缓存 =====
 _agent: Any = None

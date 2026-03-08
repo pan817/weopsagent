@@ -1,17 +1,20 @@
 """
 服务进程监控工具 - 检查服务进程状态、CPU/内存使用率等
+
+使用 LangChain 1.2.x @tool 装饰器实现，不再继承 BaseTool 类。
+私有 SSH 逻辑提取为模块级函数，保留 with_retry 重试机制。
 """
 import json
 import logging
 import time
-from typing import Any, Optional, Type
+from typing import Optional
 
 import paramiko
-from langchain_core.tools import BaseTool
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from .base import format_tool_result, safe_execute, with_retry
+from .base import format_tool_result, with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -24,119 +27,95 @@ class ProcessMonitorInput(BaseModel):
     username: str = Field(default=None, description="SSH 用户名，默认使用配置值")
 
 
-class ProcessMonitorTool(BaseTool):
-    """服务进程监控工具
+@tool("monitor_process", args_schema=ProcessMonitorInput)
+def monitor_process(
+    host: str,
+    service_name: str,
+    port: int = None,
+    username: str = None,
+) -> str:
+    """监控指定服务器上的服务进程状态。检查进程是否在运行、CPU 使用率、内存占用情况。"""
+    start_time = time.time()
+    ssh_port = port or settings.ssh_default_port
+    ssh_user = username or settings.ssh_default_user
 
-    通过 SSH 连接远程服务器，检查指定服务进程的运行状态，
-    包括进程是否存活、CPU 使用率、内存使用率、进程启动时间等。
-    """
-    name: str = "monitor_process"
-    description: str = (
-        "监控指定服务器上的服务进程状态。"
-        "可以检查进程是否在运行、CPU 使用率、内存占用情况。"
-        "输入参数: host（服务器地址）, service_name（服务进程名）"
-    )
-    args_schema: Type[BaseModel] = ProcessMonitorInput
+    try:
+        result = _check_process_via_ssh(
+            host=host,
+            service_name=service_name,
+            port=ssh_port,
+            username=ssh_user,
+            key_path=settings.ssh_default_key_path,
+        )
+        elapsed = time.time() - start_time
+        return json.dumps(
+            format_tool_result("monitor_process", True, result, elapsed=elapsed),
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(f"[ProcessMonitor] 监控失败 host={host} service={service_name}: {e}")
+        return json.dumps(
+            format_tool_result("monitor_process", False, error=str(e), elapsed=elapsed),
+            ensure_ascii=False,
+        )
 
-    def _run(
-        self,
-        host: str,
-        service_name: str,
-        port: int = None,
-        username: str = None,
-    ) -> str:
-        """同步执行进程监控"""
-        start_time = time.time()
-        ssh_port = port or settings.ssh_default_port
-        ssh_user = username or settings.ssh_default_user
-        key_path = settings.ssh_default_key_path
 
-        try:
-            result = self._check_process_via_ssh(
-                host=host,
-                service_name=service_name,
-                port=ssh_port,
-                username=ssh_user,
-                key_path=key_path,
+@with_retry(exceptions=(paramiko.SSHException, OSError))
+def _check_process_via_ssh(
+    host: str,
+    service_name: str,
+    port: int,
+    username: str,
+    key_path: str,
+) -> dict:
+    """通过 SSH 执行远程进程检查（带重试）"""
+    import os
+    key_path = os.path.expanduser(key_path)
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    connect_kwargs: dict = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": 10,
+    }
+    if os.path.exists(key_path):
+        connect_kwargs["key_filename"] = key_path
+    else:
+        connect_kwargs["allow_agent"] = True
+
+    try:
+        ssh.connect(**connect_kwargs)
+
+        _, stdout, _ = ssh.exec_command(f"pgrep -fa '{service_name}' | head -5")
+        processes = stdout.read().decode().strip()
+        process_running = bool(processes)
+
+        cpu_mem = ""
+        if process_running:
+            _, stdout, _ = ssh.exec_command(
+                f"ps aux | grep '{service_name}' | grep -v grep | "
+                f"awk '{{sum_cpu+=$3; sum_mem+=$4; count++}} END "
+                f"{{printf \"cpu=%.1f%% mem=%.1f%% count=%d\", sum_cpu, sum_mem, count}}'"
             )
-            elapsed = time.time() - start_time
-            return json.dumps(
-                format_tool_result("monitor_process", True, result, elapsed=elapsed),
-                ensure_ascii=False,
-            )
-        except Exception as e:
-            elapsed = time.time() - start_time
-            logger.error(f"[ProcessMonitor] 监控失败 host={host} service={service_name}: {e}")
-            return json.dumps(
-                format_tool_result("monitor_process", False, error=str(e), elapsed=elapsed),
-                ensure_ascii=False,
-            )
+            cpu_mem = stdout.read().decode().strip()
 
-    @with_retry(exceptions=(paramiko.SSHException, OSError))
-    def _check_process_via_ssh(
-        self,
-        host: str,
-        service_name: str,
-        port: int,
-        username: str,
-        key_path: str,
-    ) -> dict:
-        """通过 SSH 执行远程进程检查"""
-        import os
-        key_path = os.path.expanduser(key_path)
+        _, stdout, _ = ssh.exec_command(
+            "uptime && free -m | grep Mem | "
+            "awk '{print \"mem_total=\"$2\"MB mem_used=\"$3\"MB mem_free=\"$4\"MB\"}'"
+        )
+        system_info = stdout.read().decode().strip()
 
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        connect_kwargs: dict = {
-            "hostname": host,
-            "port": port,
-            "username": username,
-            "timeout": 10,
+        return {
+            "host": host,
+            "service_name": service_name,
+            "process_running": process_running,
+            "process_list": processes[:500] if processes else "",
+            "resource_usage": cpu_mem,
+            "system_info": system_info,
         }
-        if os.path.exists(key_path):
-            connect_kwargs["key_filename"] = key_path
-        else:
-            # 尝试使用 SSH Agent
-            connect_kwargs["allow_agent"] = True
-
-        try:
-            ssh.connect(**connect_kwargs)
-
-            # 检查进程是否存在
-            _, stdout, _ = ssh.exec_command(
-                f"pgrep -fa '{service_name}' | head -5"
-            )
-            processes = stdout.read().decode().strip()
-            process_running = bool(processes)
-
-            # 获取 CPU 和内存使用率
-            cpu_mem = ""
-            if process_running:
-                _, stdout, _ = ssh.exec_command(
-                    f"ps aux | grep '{service_name}' | grep -v grep | "
-                    f"awk '{{sum_cpu+=$3; sum_mem+=$4; count++}} END "
-                    f"{{printf \"cpu=%.1f%% mem=%.1f%% count=%d\", sum_cpu, sum_mem, count}}'"
-                )
-                cpu_mem = stdout.read().decode().strip()
-
-            # 获取系统整体资源
-            _, stdout, _ = ssh.exec_command(
-                "uptime && free -m | grep Mem | awk '{print \"mem_total=\"$2\"MB mem_used=\"$3\"MB mem_free=\"$4\"MB\"}'"
-            )
-            system_info = stdout.read().decode().strip()
-
-            return {
-                "host": host,
-                "service_name": service_name,
-                "process_running": process_running,
-                "process_list": processes[:500] if processes else "",
-                "resource_usage": cpu_mem,
-                "system_info": system_info,
-            }
-        finally:
-            ssh.close()
-
-    async def _arun(self, *args, **kwargs) -> str:
-        """异步执行（委托给同步方法）"""
-        return self._run(*args, **kwargs)
+    finally:
+        ssh.close()

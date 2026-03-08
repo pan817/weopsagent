@@ -20,22 +20,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from llm.model import get_llm
 from middleware.audit_log import AuditLogMiddleware
-from tools.process_monitor import ProcessMonitorTool
-from tools.redis_monitor import RedisMonitorTool
-from tools.mq_monitor import MQMonitorTool
-from tools.db_monitor import DBMonitorTool
-from tools.log_analyzer import LogAnalyzerTool
+from tools import get_tool_registry
 
 logger = logging.getLogger(__name__)
 
 # 监控 Subagent 专用工具集（只含采集类工具，无危险操作）
-MONITOR_TOOLS = [
-    ProcessMonitorTool(),
-    RedisMonitorTool(),
-    MQMonitorTool(),
-    DBMonitorTool(),
-    LogAnalyzerTool(),
-]
+MONITOR_TOOLS = get_tool_registry().get_group("monitor")
 
 # ===== 单例缓存 =====
 _agent: Any = None

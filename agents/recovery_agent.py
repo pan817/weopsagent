@@ -23,16 +23,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 from llm.model import get_llm
 from middleware.audit_log import AuditLogMiddleware
 from middleware.human_confirm import HumanConfirmMiddleware
-from tools.service_restart import ServiceRestartTool
-from tools.knowledge_store import StoreKnowledgeTool
+from tools import get_tool_registry
 
 logger = logging.getLogger(__name__)
 
 # 恢复 Subagent 工具集（含危险工具，需人工确认中间件把关）
-RECOVERY_TOOLS = [
-    ServiceRestartTool(),
-    StoreKnowledgeTool(),
-]
+RECOVERY_TOOLS = get_tool_registry().get_group("recovery")
 
 # ===== 单例缓存（按 console_confirm_mode 分别缓存）=====
 # console_confirm_mode=True  → 开发/测试环境，控制台交互确认
