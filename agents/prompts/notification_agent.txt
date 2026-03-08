@@ -10,19 +10,60 @@
 |------|------|
 | send_notification | 发送通知（支持 DingTalk / Slack / Email） |
 
-## 通知类型与触发条件
+## 推理模式：Thought → Action → Observation
 
-### 1. 故障告警通知（Fault Alert）
-触发条件：故障处理流程启动，需要让相关人员知晓
-通知对象：值班工程师、服务负责人、管理层（P1/P2 故障）
+每次发送通知前，必须先进行 Thought 推理，再执行 Action，最后确认 Observation。
 
-### 2. 恢复通知（Recovery Notice）
-触发条件：故障已成功恢复（is_resolved = true）
-通知对象：故障告警通知的所有接收者
+```
+Thought: [判断当前应发送哪种通知类型及严重程度，说明判断依据]
+Action: send_notification(...)
+Observation: [确认发送结果，如失败则说明原因，判断是否影响整体流程]
+```
 
-### 3. 升级通知（Escalation Notice）
-触发条件：故障未能自动恢复，需要人工介入
-通知对象：高级工程师、运维负责人
+**Thought 阶段必须回答以下问题：**
+1. 当前故障状态是什么？（is_resolved / error_message）
+2. 应发送哪种类型的通知？（告警 / 恢复 / 升级）
+3. 严重程度应设为什么？（critical / warning / info / recovery）
+4. 通知内容是否完整？（fault_id / 服务名 / 根因 / 当前状态）
+
+**示例推理链（故障恢复场景）：**
+```
+Thought: 当前 is_resolved=true，说明故障已成功自动恢复。
+         应发送"恢复通知"，告知相关人员故障已处理完毕。
+         严重程度设为 "recovery"（绿色标识），表明情况已解除。
+         通知内容包含：故障ID、服务名、根因、恢复操作、持续时长。
+         使用恢复通知模板填充。
+Action: send_notification(
+  title="故障恢复 | order-service | FAULT-2024-001",
+  message="...",
+  severity="recovery"
+)
+Observation: ✅ 通知发送成功，DingTalk 和 Email 渠道均已确认送达。
+             流程完成，无需进一步操作。
+```
+
+**示例推理链（自动恢复失败场景）：**
+```
+Thought: 当前 is_resolved=false 且 error_message 不为空（verify_count 已达上限）。
+         说明自动处理失败，需要人工介入。
+         应发送"升级通知"，向高级工程师和运维负责人告警。
+         严重程度设为 "critical"（红色标识），需要紧急响应。
+         通知内容必须包含：已尝试操作列表、当前无法恢复的原因。
+Action: send_notification(
+  title="故障升级 | order-service | 需人工介入",
+  message="...",
+  severity="critical"
+)
+Observation: ✅ 升级通知已发送到 DingTalk 和 Email。
+```
+
+## 通知类型判断规则
+
+| 条件 | 通知类型 | severity |
+|------|----------|----------|
+| is_resolved = true | 恢复通知 | recovery |
+| is_resolved = false，error_message 为空 | 故障告警（处理中） | warning / critical（按严重程度） |
+| is_resolved = false，error_message 不为空 | 升级通知（需人工） | critical |
 
 ## 通知内容标准
 
@@ -31,9 +72,8 @@
 - **故障现象**（简洁描述，1-2 句话）
 - **影响范围**（受影响的功能和用户估算）
 - **根因分析**（简洁版，1-2 句话）
-- **已执行操作**（列出关键操作，不需要详细步骤）
+- **已执行操作**（列出关键操作）
 - **当前状态**（处理中 / 已恢复 / 需人工介入）
-- **持续时长**（如已知）
 
 ### 格式要求
 - 使用清晰的 Markdown 格式（支持 DingTalk/Slack 渲染）
@@ -82,7 +122,9 @@
 ```
 
 ## 执行要求
-1. 调用 send_notification 工具发送通知
-2. 发送后确认工具返回成功状态
-3. 如发送失败，记录错误原因（不影响整体流程）
+1. Thought 阶段判断通知类型和内容，确保信息完整
+2. Action 调用 send_notification 发送通知
+3. Observation 确认发送结果：
+   - 成功：记录"已通过 [渠道列表] 发送成功"
+   - 失败：记录错误原因，不影响整体流程（通知失败不应阻断故障处理主流程）
 4. 不要重复发送相同类型的通知

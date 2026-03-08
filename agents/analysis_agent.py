@@ -101,12 +101,23 @@ def run_analysis_node(state: Dict[str, Any], config: RunnableConfig) -> Dict[str
         root_cause = _extract_section(analysis_text, "根因分析")
         recovery_plan = _extract_section(analysis_text, "恢复方案")
 
+        if not root_cause:
+            logger.warning(
+                f"[AnalysisAgent] 未找到 '### 根因分析' 章节，将使用全文前500字降级 "
+                f"fault_id={fault_id}。请检查 analysis_agent.txt 输出格式约束。"
+            )
+        if not recovery_plan:
+            logger.warning(
+                f"[AnalysisAgent] 未找到 '### 恢复方案' 章节，下游 RecoveryAgent 将使用全文 "
+                f"fault_id={fault_id}。请检查 analysis_agent.txt 输出格式约束。"
+            )
+
         logger.info(f"[AnalysisAgent] 分析完成 fault_id={fault_id}")
 
         return {
             "analysis_result": analysis_text,
             "root_cause": root_cause or analysis_text[:500],
-            "recovery_plan": recovery_plan or "请参考完整分析结果",
+            "recovery_plan": recovery_plan or analysis_text,
             "messages": messages[-1:] if messages else [],
         }
     except Exception as e:
@@ -135,9 +146,25 @@ def _extract_last_text(messages) -> str:
 
 
 def _extract_section(text: str, section_name: str) -> str:
-    """从 Markdown 格式文本中提取指定 ### 小节的内容"""
-    pattern = rf"###\s*{section_name}\s*\n(.*?)(?=###|\Z)"
-    match = re.search(pattern, text, re.DOTALL)
+    """
+    从 Markdown 格式文本中提取指定 ### 小节的内容。
+
+    匹配规则：
+    - 优先精确匹配：`### {section_name}` 后紧跟换行（标题后无额外文字）
+    - 降级模糊匹配：`### {section_name}` 后跟任意非换行字符再换行
+      （容忍 LLM 偶尔在标题后加冒号/空格，但不容忍加括号内容）
+    内容范围：匹配到下一个 ## 或 ### 标题、文件末尾为止。
+    """
+    # 优先：精确匹配（标题后直接换行）
+    pattern_exact = rf"###\s+{re.escape(section_name)}\s*\n(.*?)(?=\n##|\Z)"
+    match = re.search(pattern_exact, text, re.DOTALL)
     if match:
         return match.group(1).strip()
+
+    # 降级：允许标题行尾有少量额外字符（如冒号、空格），但不允许有括号
+    pattern_loose = rf"###\s+{re.escape(section_name)}[^\n（(]*\n(.*?)(?=\n##|\Z)"
+    match = re.search(pattern_loose, text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
     return ""

@@ -1,10 +1,14 @@
 """
 故障规划器模块 - 解析故障描述，加载服务拓扑，制定分析计划
 
-规划器负责：
+规划器职责（精简版）：
 1. 从故障描述中推断受影响的服务名称
 2. 加载服务的全链路依赖拓扑（service_node/*.md）
-3. 根据告警类型制定监控分析计划
+3. 将原始故障描述直接用作知识库检索 query（避免关键词误分类污染 RAG 结果）
+
+移除的功能（方案B+C）：
+- alert_type 关键词分类：分类结果未被任何 Agent 使用，且误分类会污染知识库检索
+- monitoring_steps 构建：生成后从未传入 FaultState，是死代码
 """
 import logging
 import re
@@ -19,18 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 class AlertType(str, Enum):
-    """告警类型枚举"""
-    SERVICE_UNSTABLE = "service_unstable"          # 服务不稳定
-    API_SLOW = "api_slow"                           # 接口响应缓慢
-    API_ERROR = "api_error"                         # 接口报错
-    DATA_INCONSISTENCY = "data_inconsistency"       # 数据不一致
-    SERVICE_DOWN = "service_down"                   # 服务宕机
-    HIGH_CPU = "high_cpu"                           # CPU 使用率高
-    HIGH_MEMORY = "high_memory"                     # 内存使用率高
-    DB_SLOW_QUERY = "db_slow_query"                 # 数据库慢查询
-    MQ_BACKLOG = "mq_backlog"                       # 消息队列积压
-    REDIS_ERROR = "redis_error"                     # Redis 异常
-    UNKNOWN = "unknown"                             # 未知类型
+    """
+    告警类型枚举（仅用于 API 返回值类型标注，不再做自动分类）
+
+    当前所有故障均以 UNKNOWN 处理，由 MonitorAgent + AnalysisAgent 自行推断真实类型。
+    保留此枚举是为了保持 FaultState 和 API 返回结构的向后兼容。
+    """
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -53,51 +52,18 @@ class FaultAnalysisPlan:
     fault_id: str
     fault_description: str
     service_name: str
-    alert_type: AlertType
+    alert_type: AlertType          # 固定为 UNKNOWN，由下游 Agent 自行判断
     service_node: Optional[ServiceNode]
-    monitoring_steps: List[str]
-    knowledge_query: str
+    knowledge_query: str           # 直接使用原始故障描述，不拼接推断字段
     raw_service_info: str
-
-
-# 告警类型关键词映射
-ALERT_KEYWORDS: Dict[AlertType, List[str]] = {
-    AlertType.SERVICE_DOWN: [
-        "宕机", "down", "不可用", "崩溃", "crash", "挂了", "无法连接", "connection refused",
-    ],
-    AlertType.SERVICE_UNSTABLE: [
-        "不稳定", "抖动", "波动", "偶发", "间歇", "unstable", "flapping",
-    ],
-    AlertType.API_SLOW: [
-        "响应慢", "超时", "timeout", "slow", "延迟高", "latency", "请求缓慢",
-    ],
-    AlertType.API_ERROR: [
-        "报错", "500", "error", "exception", "异常", "失败率", "错误率",
-    ],
-    AlertType.DATA_INCONSISTENCY: [
-        "数据不一致", "脏数据", "数据丢失", "数据异常", "inconsistent",
-    ],
-    AlertType.HIGH_CPU: [
-        "cpu高", "cpu使用率", "cpu load", "负载高", "high cpu",
-    ],
-    AlertType.HIGH_MEMORY: [
-        "内存", "oom", "out of memory", "内存溢出", "内存泄漏", "gc频繁",
-    ],
-    AlertType.DB_SLOW_QUERY: [
-        "慢sql", "slow query", "数据库慢", "db slow", "查询超时",
-    ],
-    AlertType.MQ_BACKLOG: [
-        "消息积压", "队列积压", "mq", "rabbit", "kafka", "消息堆积",
-    ],
-    AlertType.REDIS_ERROR: [
-        "redis", "缓存", "cache", "redis超时", "redis连接",
-    ],
-}
 
 
 class FaultPlanner:
     """
     故障规划器 - 解析故障上下文并制定分析计划
+
+    核心职责：根据故障描述找到对应的服务拓扑配置文件，
+    为后续 Agent 提供准确的主机地址、中间件连接信息等结构化数据。
     """
 
     def __init__(self):
@@ -199,11 +165,11 @@ class FaultPlanner:
         """
         从故障描述中推断受影响的服务名称
 
-        先精确匹配已知服务名，再模糊匹配。
+        先精确匹配已知服务名，再模糊匹配常见服务关键词。
         """
         desc_lower = fault_description.lower()
 
-        # 精确匹配已知服务名
+        # 精确匹配已知服务名（来自 service_node/*.md 文件名）
         for service_name in self._service_nodes_cache.keys():
             if service_name in desc_lower:
                 logger.info(f"[FaultPlanner] 推断服务名: {service_name} (精确匹配)")
@@ -234,18 +200,6 @@ class FaultPlanner:
 
         logger.warning("[FaultPlanner] 无法推断服务名，使用 unknown")
         return "unknown"
-
-    def identify_alert_type(self, fault_description: str) -> AlertType:
-        """从故障描述中识别告警类型"""
-        desc_lower = fault_description.lower()
-
-        for alert_type, keywords in ALERT_KEYWORDS.items():
-            for kw in keywords:
-                if kw.lower() in desc_lower:
-                    logger.info(f"[FaultPlanner] 识别告警类型: {alert_type} (关键词: {kw})")
-                    return alert_type
-
-        return AlertType.UNKNOWN
 
     def get_service_node(self, service_name: str) -> Optional[ServiceNode]:
         """获取服务节点配置"""
@@ -291,71 +245,27 @@ class FaultPlanner:
             fault_description: 故障描述文本
 
         Returns:
-            FaultAnalysisPlan: 完整的故障分析计划
+            FaultAnalysisPlan: 包含服务拓扑信息和 RAG 检索 query 的分析计划
         """
         service_name = self.infer_service_name(fault_description)
-        alert_type = self.identify_alert_type(fault_description)
         service_node = self.get_service_node(service_name)
         service_info = self.format_service_info(service_node)
 
-        # 根据告警类型制定监控步骤
-        monitoring_steps = self._build_monitoring_steps(alert_type, service_node)
-
-        # 构建知识库检索查询
-        knowledge_query = f"{fault_description} {alert_type.value} {service_name}"
+        # 直接使用原始故障描述作为知识库检索 query
+        # 避免拼接可能错误的 alert_type/service_name 污染 RAG 语义检索
+        knowledge_query = fault_description
 
         logger.info(
             f"[FaultPlanner] 已创建故障分析计划 "
-            f"fault_id={fault_id} service={service_name} alert_type={alert_type}"
+            f"fault_id={fault_id} service={service_name}"
         )
 
         return FaultAnalysisPlan(
             fault_id=fault_id,
             fault_description=fault_description,
             service_name=service_name,
-            alert_type=alert_type,
+            alert_type=AlertType.UNKNOWN,
             service_node=service_node,
-            monitoring_steps=monitoring_steps,
             knowledge_query=knowledge_query,
             raw_service_info=service_info,
         )
-
-    def _build_monitoring_steps(
-        self,
-        alert_type: AlertType,
-        service_node: Optional[ServiceNode],
-    ) -> List[str]:
-        """根据告警类型构建监控步骤"""
-        steps = []
-
-        # 基础监控步骤（所有类型都执行）
-        if service_node and service_node.hosts:
-            for host in service_node.hosts[:2]:  # 最多检查 2 台
-                steps.append(f"monitor_process: host={host}")
-                if service_node.log_paths:
-                    for log_path in service_node.log_paths[:2]:
-                        steps.append(f"analyze_logs: host={host}, log_path={log_path}")
-
-        # 数据库相关
-        if alert_type in (AlertType.API_SLOW, AlertType.DB_SLOW_QUERY, AlertType.DATA_INCONSISTENCY):
-            steps.append("monitor_database: check_slow_queries")
-
-        # Redis 相关
-        if alert_type in (AlertType.API_SLOW, AlertType.REDIS_ERROR, AlertType.SERVICE_UNSTABLE):
-            steps.append("monitor_redis: check_memory_and_connections")
-
-        # MQ 相关
-        if alert_type in (AlertType.MQ_BACKLOG, AlertType.DATA_INCONSISTENCY):
-            steps.append("monitor_mq: check_queue_backlog")
-
-        # 服务宕机
-        if alert_type == AlertType.SERVICE_DOWN:
-            steps.append("monitor_process: check_all_instances")
-            steps.append("analyze_logs: check_startup_errors")
-
-        # 内存溢出
-        if alert_type == AlertType.HIGH_MEMORY:
-            steps.append("monitor_process: check_memory_usage")
-            steps.append("analyze_logs: grep_oom_errors")
-
-        return steps or ["monitor_process", "analyze_logs", "monitor_database", "monitor_redis", "monitor_mq"]

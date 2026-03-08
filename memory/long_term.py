@@ -218,20 +218,28 @@ class LongTermMemory:
         all_results.sort(key=lambda x: x[1], reverse=True)
         return [doc for doc, _ in all_results[:top_k]]
 
-    def search_all_categories(self, query: str, top_k_each: int = 3) -> Dict[str, List[Document]]:
+    def search_all_categories(
+        self,
+        query: str,
+        top_k_each: int = 3,
+        score_threshold: Optional[float] = None,
+    ) -> Dict[str, List[Document]]:
         """
         分别检索三个知识库类别，返回各类别的结果
 
         Args:
             query: 检索查询
             top_k_each: 每个类别返回的最大条数
+            score_threshold: 相关性阈值，None 则使用 settings.rag_score_threshold
 
         Returns:
             {"general": [...], "scenario": [...], "history": [...]}
         """
+        threshold = score_threshold if score_threshold is not None else settings.rag_score_threshold
         results = {}
         for category in ["general", "scenario", "history"]:
-            docs = self.search(query, category=category, top_k=top_k_each)
+            docs = self.search(query, category=category, top_k=top_k_each,
+                               score_threshold=threshold)
             results[category] = docs
         return results
 
@@ -240,19 +248,50 @@ class LongTermMemory:
         query: str,
         top_k: int = 5,
         max_chars: int = 3000,
+        score_threshold: Optional[float] = None,
     ) -> str:
         """
-        检索并格式化知识库内容，用于注入 Prompt
+        检索并格式化知识库内容，用于注入 AnalysisAgent prompt。
+
+        相关性过滤逻辑：
+        - 每条检索结果必须达到 score_threshold（默认 settings.rag_score_threshold=0.65）
+        - 低于阈值的结果直接丢弃，不传入 prompt，避免低质量内容误导分析
+        - 所有结果均被过滤时，返回明确的"无历史参考"说明，引导 Agent 依赖监控数据
 
         Args:
-            query: 故障描述
-            top_k: 检索结果总数
-            max_chars: 最大字符数限制
+            query: 故障描述（直接作为语义检索 query）
+            top_k: 检索结果总数上限
+            max_chars: 注入 prompt 的最大字符数
+            score_threshold: 相关性阈值，None 则读取 settings.rag_score_threshold
 
         Returns:
             格式化的知识库内容字符串
         """
-        results = self.search_all_categories(query, top_k_each=top_k // 3 + 1)
+        threshold = score_threshold if score_threshold is not None else settings.rag_score_threshold
+        results = self.search_all_categories(
+            query,
+            top_k_each=top_k // 3 + 1,
+            score_threshold=threshold,
+        )
+
+        total_found = sum(len(docs) for docs in results.values())
+        logger.info(
+            f"[LongTermMemory] RAG 检索完成 threshold={threshold:.2f} "
+            f"命中: general={len(results['general'])} "
+            f"scenario={len(results['scenario'])} "
+            f"history={len(results['history'])}"
+        )
+
+        if total_found == 0:
+            logger.info(
+                f"[LongTermMemory] 未找到相关性 >= {threshold:.2f} 的知识，"
+                "返回无历史参考提示"
+            )
+            return (
+                "【知识库检索结果】\n"
+                f"未找到与当前故障相关性 ≥ {threshold:.2f} 的历史案例或处理方案。\n"
+                "请完全依赖本次采集的监控数据进行独立分析，不要假设存在历史经验。"
+            )
 
         sections = []
 
@@ -285,9 +324,6 @@ class LongTermMemory:
                     f"**{doc.metadata.get('title', '未知')}** (相关性: {score:.2f})\n"
                     f"{doc.page_content[:500]}"
                 )
-
-        if not sections:
-            return "（知识库中未找到相关处理方案）"
 
         context = "\n\n".join(sections)
         # 截断以控制 Prompt 长度

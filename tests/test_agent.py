@@ -29,40 +29,17 @@ class TestFaultPlanner:
         service = self.planner.infer_service_name("用户登录接口响应超时")
         assert "user" in service.lower() or service == "unknown"
 
-    def test_identify_alert_type_slow(self):
-        """测试识别响应缓慢告警"""
-        from planner.fault_planner import AlertType
-        alert = self.planner.identify_alert_type("接口响应很慢，超时了")
-        assert alert == AlertType.API_SLOW
-
-    def test_identify_alert_type_error(self):
-        """测试识别接口报错告警"""
-        from planner.fault_planner import AlertType
-        alert = self.planner.identify_alert_type("接口大量报错，500错误")
-        assert alert in (AlertType.API_ERROR, AlertType.SERVICE_UNSTABLE, AlertType.SERVICE_DOWN)
-
-    def test_identify_alert_type_redis(self):
-        """测试识别 Redis 异常告警"""
-        from planner.fault_planner import AlertType
-        alert = self.planner.identify_alert_type("Redis 连接失败，缓存不可用")
-        assert alert == AlertType.REDIS_ERROR
-
-    def test_identify_alert_type_unknown(self):
-        """测试无法识别的告警类型"""
-        from planner.fault_planner import AlertType
-        alert = self.planner.identify_alert_type("某个奇怪的问题发生了")
-        assert alert == AlertType.UNKNOWN
-
     def test_create_plan_returns_correct_structure(self):
         """测试创建计划返回正确结构"""
+        from planner.fault_planner import AlertType
         plan = self.planner.create_plan("FAULT-001", "订单服务接口超时")
         assert plan.fault_id == "FAULT-001"
         assert plan.fault_description == "订单服务接口超时"
         assert plan.service_name is not None
-        assert plan.alert_type is not None
-        assert isinstance(plan.monitoring_steps, list)
-        assert len(plan.monitoring_steps) > 0
-        assert plan.knowledge_query != ""
+        # alert_type 固定为 UNKNOWN，由下游 Agent 自行判断
+        assert plan.alert_type == AlertType.UNKNOWN
+        # knowledge_query 直接使用原始故障描述，保证 RAG 语义准确
+        assert plan.knowledge_query == "订单服务接口超时"
 
     def test_format_service_info_with_node(self):
         """测试有服务节点时的信息格式化"""
@@ -105,7 +82,7 @@ class TestFaultAgent:
         mock_plan = MagicMock()
         mock_plan.fault_id = "FAULT-001"
         mock_plan.service_name = "order-service"
-        mock_plan.alert_type = AlertType.API_SLOW
+        mock_plan.alert_type = AlertType.UNKNOWN
         mock_plan.raw_service_info = "订单服务在 192.168.1.101"
         mock_plan.knowledge_query = "订单服务响应慢"
         mock_planner_class.return_value.create_plan.return_value = mock_plan
@@ -158,7 +135,7 @@ class TestFaultAgent:
         mock_plan = MagicMock()
         mock_plan.fault_id = "FAULT-002"
         mock_plan.service_name = "order-service"
-        mock_plan.alert_type = AlertType.SERVICE_DOWN
+        mock_plan.alert_type = AlertType.UNKNOWN
         mock_plan.raw_service_info = ""
         mock_plan.knowledge_query = ""
         mock_planner_class.return_value.create_plan.return_value = mock_plan
@@ -429,7 +406,7 @@ class TestMultiAgentFaultAgent:
         mock_plan = MagicMock()
         mock_plan.fault_id = "FAULT-MA-001"
         mock_plan.service_name = "order-service"
-        mock_plan.alert_type = AlertType.API_SLOW
+        mock_plan.alert_type = AlertType.UNKNOWN
         mock_plan.raw_service_info = "订单服务 192.168.1.101"
         mock_plan.knowledge_query = "订单服务响应慢"
         mock_planner_class.return_value.create_plan.return_value = mock_plan
@@ -479,7 +456,7 @@ class TestMultiAgentFaultAgent:
         mock_plan = MagicMock()
         mock_plan.fault_id = "FAULT-MA-002"
         mock_plan.service_name = "payment-service"
-        mock_plan.alert_type = AlertType.SERVICE_DOWN
+        mock_plan.alert_type = AlertType.UNKNOWN
         mock_plan.raw_service_info = ""
         mock_plan.knowledge_query = "支付服务宕机"
         mock_planner_class.return_value.create_plan.return_value = mock_plan

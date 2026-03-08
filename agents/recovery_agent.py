@@ -12,6 +12,7 @@ Subagent 设计要点：
 使用工具：restart_service（⚠️危险）、store_knowledge（安全）
 """
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict
 
@@ -165,11 +166,45 @@ def _extract_last_text(messages) -> str:
 
 
 def _check_resolved(recovery_text: str) -> bool:
-    """从恢复 Agent 输出文本中判断故障是否已恢复"""
+    """
+    从 RecoveryAgent 输出文本中判断故障是否已恢复。
+
+    解析策略（优先级从高到低）：
+    1. 结构化标记解析（主路径）：匹配 prompt 中约定的 `RECOVERY_STATUS: RESOLVED/PARTIAL/FAILED`
+       只有明确为 RESOLVED 才返回 True，PARTIAL 和 FAILED 均返回 False
+    2. 关键词匹配（降级路径）：LLM 未输出机器可读标记时的兜底
+       仅在确认无否定语境时才判为已恢复
+    """
+    # ── 主路径：解析机器可读状态行 ──────────────────────────────────────────────
+    status_match = re.search(
+        r"RECOVERY_STATUS\s*:\s*(RESOLVED|PARTIAL|FAILED)",
+        recovery_text,
+        re.IGNORECASE,
+    )
+    if status_match:
+        status = status_match.group(1).upper()
+        resolved = status == "RESOLVED"
+        logger.info(f"[RecoveryAgent] 解析到机器可读状态: {status} → is_resolved={resolved}")
+        return resolved
+
+    # ── 降级路径：关键词匹配 ─────────────────────────────────────────────────────
+    logger.warning(
+        "[RecoveryAgent] 未找到 RECOVERY_STATUS 机器可读标记，降级为关键词匹配。"
+        "请检查 recovery_agent.txt 输出格式约束。"
+    )
     text_lower = recovery_text.lower()
-    resolved_keywords = ["resolved", "已恢复", "恢复成功", "故障已消除", "服务正常"]
+    # 明确排除 PARTIAL / FAILED 关键词优先
+    if any(kw in text_lower for kw in ["partial", "failed", "未恢复", "恢复失败", "需人工"]):
+        return False
+    # 有明确恢复词且无否定前缀
+    resolved_keywords = ["resolved", "已恢复", "恢复成功", "故障已消除"]
     for kw in resolved_keywords:
         if kw in text_lower:
-            if "未" + kw not in text_lower and "没有" + kw not in text_lower:
+            # 检查否定前缀：未/没有/尚未/仍未
+            negative_prefix = any(
+                neg + kw in text_lower
+                for neg in ["未", "没有", "尚未", "仍未"]
+            )
+            if not negative_prefix:
                 return True
     return False

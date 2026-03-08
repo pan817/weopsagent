@@ -38,6 +38,16 @@ class Settings(BaseSettings):
     # ===== Embedding =====
     embedding_model: str = Field(default="text-embedding-ada-002", description="Embedding 模型名")
 
+    # ===== RAG 相关性过滤 =====
+    rag_score_threshold: float = Field(
+        default=0.65,
+        description=(
+            "RAG 检索相关性阈值（0-1）。低于此分数的结果会被过滤，不传入 AnalysisAgent prompt。"
+            "0.65 = 推荐起点，知识库内容丰富后可适当调高至 0.70~0.75；"
+            "可通过环境变量 RAG_SCORE_THRESHOLD 覆盖。"
+        ),
+    )
+
     # ===== API Server =====
     api_host: str = Field(default="0.0.0.0", description="API 监听地址")
     api_port: int = Field(default=8080, description="API 监听端口")
@@ -103,10 +113,6 @@ class Settings(BaseSettings):
     @property
     def service_node_dir(self) -> Path:
         return PROJECT_ROOT / "service_node"
-
-    @property
-    def prompts_dir(self) -> Path:
-        return PROJECT_ROOT / "prompts" / "templates"
 
     @property
     def restart_blacklist(self) -> List[str]:
