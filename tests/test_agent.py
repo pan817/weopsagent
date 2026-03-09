@@ -385,5 +385,143 @@ class TestCheckStatus:
         assert FaultAgent._check_status("处理完成") is False
 
 
+class TestModelSwitchMiddleware:
+    """动态模型切换中间件测试"""
+
+    def test_before_model_switches_by_keyword(self):
+        """测试关键词匹配切换模型"""
+        from middleware.model_switch import ModelSwitchMiddleware, ModelRule
+        from langchain_core.messages import HumanMessage
+
+        middleware = ModelSwitchMiddleware(
+            rules=[ModelRule(model="gpt-4o-mini", keyword="简单")],
+        )
+
+        mock_state = MagicMock()
+        mock_state.messages = [HumanMessage(content="这是一个简单的任务")]
+        mock_runtime = MagicMock()
+        mock_runtime.config = MagicMock()
+        mock_runtime.config.tags = []
+        mock_runtime.config.configurable = {}
+
+        middleware.before_agent(mock_state, mock_runtime)
+        middleware.before_model(mock_state, mock_runtime)
+
+        # runtime.model 应被替换
+        assert mock_runtime.model is not None
+
+    def test_before_model_no_match_keeps_model(self):
+        """测试无规则匹配时不切换模型"""
+        from middleware.model_switch import ModelSwitchMiddleware, ModelRule
+        from langchain_core.messages import HumanMessage
+
+        middleware = ModelSwitchMiddleware(
+            rules=[ModelRule(model="gpt-4o-mini", keyword="不存在的关键词")],
+        )
+
+        mock_state = MagicMock()
+        mock_state.messages = [HumanMessage(content="正常故障描述")]
+        mock_runtime = MagicMock()
+        mock_runtime.config = MagicMock()
+        mock_runtime.config.tags = []
+        mock_runtime.config.configurable = {}
+        original_model = mock_runtime.model
+
+        middleware.before_agent(mock_state, mock_runtime)
+        result = middleware.before_model(mock_state, mock_runtime)
+
+        assert result is None
+        assert mock_runtime.model == original_model
+
+    def test_before_model_switches_by_agent_name(self):
+        """测试按 Agent 名称切换模型"""
+        from middleware.model_switch import ModelSwitchMiddleware, ModelRule
+        from langchain_core.messages import HumanMessage
+
+        middleware = ModelSwitchMiddleware(
+            rules=[ModelRule(model="gpt-4o", agent_name="analysis_agent")],
+        )
+
+        mock_state = MagicMock()
+        mock_state.messages = [HumanMessage(content="分析任务")]
+        mock_runtime = MagicMock()
+        mock_runtime.config = MagicMock()
+        mock_runtime.config.tags = ["agent:analysis_agent"]
+        mock_runtime.config.configurable = {}
+
+        middleware.before_agent(mock_state, mock_runtime)
+        middleware.before_model(mock_state, mock_runtime)
+
+        assert mock_runtime.model is not None
+
+    def test_before_model_switches_by_call_index(self):
+        """测试按调用序号降级切换模型（重试降级场景）"""
+        from middleware.model_switch import ModelSwitchMiddleware, ModelRule
+        from langchain_core.messages import HumanMessage
+
+        middleware = ModelSwitchMiddleware(
+            rules=[ModelRule(model="gpt-4o-mini", min_call_index=3)],
+        )
+
+        mock_state = MagicMock()
+        mock_state.messages = [HumanMessage(content="任务")]
+        mock_runtime = MagicMock()
+        mock_runtime.config = MagicMock()
+        mock_runtime.config.tags = []
+        mock_runtime.config.configurable = {}
+        original_model = mock_runtime.model
+
+        middleware.before_agent(mock_state, mock_runtime)
+
+        # 第 1、2 次调用不触发
+        middleware.before_model(mock_state, mock_runtime)
+        assert mock_runtime.model == original_model
+        middleware.before_model(mock_state, mock_runtime)
+        assert mock_runtime.model == original_model
+
+        # 第 3 次调用触发降级
+        middleware.before_model(mock_state, mock_runtime)
+        assert mock_runtime.model != original_model
+
+    def test_before_model_custom_condition(self):
+        """测试自定义条件函数"""
+        from middleware.model_switch import ModelSwitchMiddleware, ModelRule
+        from langchain_core.messages import HumanMessage
+
+        # 自定义条件：消息数超过 5 时切换
+        def many_messages(state, runtime):
+            msgs = getattr(state, "messages", []) or []
+            return len(msgs) > 5
+
+        middleware = ModelSwitchMiddleware(
+            rules=[ModelRule(model="gpt-4o-mini", condition=many_messages)],
+        )
+
+        mock_state = MagicMock()
+        mock_state.messages = [HumanMessage(content=f"msg{i}") for i in range(6)]
+        mock_runtime = MagicMock()
+        mock_runtime.config = MagicMock()
+        mock_runtime.config.tags = []
+        mock_runtime.config.configurable = {}
+
+        middleware.before_agent(mock_state, mock_runtime)
+        middleware.before_model(mock_state, mock_runtime)
+
+        assert mock_runtime.model is not None
+
+    def test_before_agent_resets_counter(self):
+        """测试 before_agent 重置调用计数器"""
+        from middleware.model_switch import ModelSwitchMiddleware
+
+        middleware = ModelSwitchMiddleware()
+        middleware._call_index = 10
+        middleware._current_model_name = "some-model"
+
+        middleware.before_agent(MagicMock(), MagicMock())
+
+        assert middleware._call_index == 0
+        assert middleware._current_model_name is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

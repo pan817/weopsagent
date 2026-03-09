@@ -30,6 +30,7 @@ from agents.notification_agent import run_notification
 from llm.model import get_llm
 from memory.long_term import get_long_term_memory
 from middleware.audit_log import AuditLogMiddleware
+from middleware.model_switch import ModelSwitchMiddleware, ModelRule
 from planner.fault_planner import FaultPlanner
 
 logger = logging.getLogger(__name__)
@@ -63,9 +64,11 @@ class FaultAgent:
         self,
         console_confirm_mode: bool = True,
         enable_audit_log: bool = True,
+        model_rules: list = None,
     ):
         self.console_confirm_mode = console_confirm_mode
         self.enable_audit_log = enable_audit_log
+        self.model_rules = model_rules
 
         # 设置 RecoveryAgent 的确认模式
         set_console_confirm_mode(console_confirm_mode)
@@ -84,10 +87,14 @@ class FaultAgent:
         logger.info("[FaultAgent] 主 Agent 初始化完成")
 
     def _build_agent(self) -> Any:
-        """构建主 Agent（create_agent + 子 Agent 工具）"""
+        """构建主 Agent（create_agent + 子 Agent 工具 + 中间件）"""
         middleware = []
         if self.enable_audit_log:
             middleware.append(AuditLogMiddleware())
+
+        # 动态模型切换中间件（before_model 阶段根据规则替换模型）
+        if self.model_rules:
+            middleware.append(ModelSwitchMiddleware(rules=self.model_rules))
 
         return create_agent(
             model=get_llm(),

@@ -102,8 +102,8 @@ def run_monitoring(task_description: str) -> str:
 |------|------|
 | `agents/` | 主 Agent + 子 Agent + prompts |
 | `tools/` | 监控/恢复/通知工具 (ToolRegistry 管理) |
-| `middleware/` | 审计日志 + 人工确认中间件 |
-| `memory/` | 短期记忆 (会话) + 长期记忆 (ChromaDB RAG) |
+| `middleware/` | 审计日志 + 人工确认 + 动态模型切换中间件 |
+| `memory/` | 长期记忆 (ChromaDB RAG)，短期记忆由 checkpointer 自动管理 |
 | `config/` | Pydantic Settings 配置 |
 | `planner/` | 故障规划器 (服务推断 + 拓扑加载) |
 | `data/` | 知识库 Markdown (general/scenarios/history) |
@@ -121,11 +121,38 @@ GET    /api/v1/health                 # 健康检查
 POST   /api/v1/knowledge/reload       # 热加载知识库
 ```
 
+## Middleware
+
+项目使用 LangChain 1.2.x `AgentMiddleware` 机制，通过 `create_agent(middleware=[...])` 注入：
+
+| 中间件 | hook | 说明 |
+|--------|------|------|
+| `AuditLogMiddleware` | 全部 | 审计日志，记录 Agent/LLM/Tool 各阶段 |
+| `HumanConfirmMiddleware` | `wrap_tool_call` | 危险操作人工确认 |
+| `ModelSwitchMiddleware` | `before_model` | 动态切换 LLM 模型 |
+
+### ModelSwitchMiddleware 使用示例
+
+```python
+from middleware.model_switch import ModelSwitchMiddleware, ModelRule
+
+agent = FaultAgent(
+    model_rules=[
+        ModelRule(agent_name="monitor_agent", model="gpt-4o-mini"),   # 监控用低成本模型
+        ModelRule(agent_name="analysis_agent", model="gpt-4o"),       # 分析用高能力模型
+        ModelRule(min_call_index=5, model="gpt-4o-mini"),             # 第5次调用后降级
+        ModelRule(keyword="简单", model="gpt-4o-mini"),                # 关键词匹配
+        ModelRule(condition=lambda s, r: ..., model="gpt-4o"),        # 自定义条件
+    ],
+)
+```
+
 ## 重要注意事项
 
 - **危险工具**: `restart_service` 等需经 `HumanConfirmMiddleware` 人工确认
 - **DANGEROUS_TOOLS 集合**: `{"restart_service", "kill_process", "execute_sql", "flush_redis", "purge_mq_queue"}`
 - **ToolRegistry 分组**: `monitor`(5), `recovery`(2), `notification`(1), `all`(8)
+- **短期记忆**: 由 `InMemorySaver` checkpointer 按 `thread_id` 自动管理，无需手工维护
 - **ChromaDB**: 需要 `langchain-chroma` 包（不是 `langchain-community`）
 - **SSH 工具**: 需要 `paramiko` + 有效 SSH 密钥 (`SSH_DEFAULT_KEY_PATH`)
 - **环境变量**: 复制 `.env.example` 为 `.env` 并配置 `OPENAI_API_KEY`
