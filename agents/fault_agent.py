@@ -1,36 +1,55 @@
 """
-多 Agent 故障处理入口 - FaultAgent 高级封装
+故障处理主 Agent - 通过 tools 调用子 Agent 架构
 
-封装了基于 LangGraph StateGraph 的多 Agent 协作流程：
-  1. FaultPlanner 推断服务名、告警类型、服务拓扑
-  2. 从 LongTermMemory 检索相关知识（RAG）
-  3. 构建初始 FaultState 并调用 StateGraph（monitor→analysis→recovery→notify）
-  4. 从最终 State 中提取处理结果并返回
+FaultAgent 作为主 Agent，绑定 4 个子 Agent 工具（run_monitoring / run_analysis /
+run_recovery / run_notification），由主 Agent 的 LLM 自主决定调用顺序，
+system prompt 引导标准工作流程。
 
-对外接口与 agent/fault_agent.py 保持兼容，可直接替换。
+架构：
+  FaultAgent (create_agent)
+    ├── run_monitoring   → MonitorAgent (子Agent，内含 5 个监控工具)
+    ├── run_analysis     → AnalysisAgent (子Agent，纯 LLM 推理)
+    ├── run_recovery     → RecoveryAgent (子Agent，含危险操作 + 人工确认)
+    └── run_notification → NotificationAgent (子Agent，通知发送)
 """
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
 
-from agents.coordinator import get_fault_graph
+from agents.monitor_agent import run_monitoring
+from agents.analysis_agent import run_analysis
+from agents.recovery_agent import run_recovery, set_console_confirm_mode
+from agents.notification_agent import run_notification
+from llm.model import get_llm
 from memory.long_term import get_long_term_memory
-from memory.short_term import get_short_term_memory
+from middleware.audit_log import AuditLogMiddleware
 from planner.fault_planner import FaultPlanner
 
 logger = logging.getLogger(__name__)
 
+# 主 Agent 的子 Agent 工具列表
+FAULT_AGENT_TOOLS = [run_monitoring, run_analysis, run_recovery, run_notification]
+
+
+def _load_prompt() -> str:
+    """从 agents/prompts/fault_agent.txt 加载主 Agent System Prompt"""
+    prompt_path = Path(__file__).parent / "prompts" / "fault_agent.txt"
+    return prompt_path.read_text(encoding="utf-8").strip()
+
 
 class FaultAgent:
     """
-    多 Agent 故障处理的高级封装
+    故障处理主 Agent
 
-    提供与单 Agent 版本相同的公共接口（handle_fault / continue_conversation），
-    内部使用 LangGraph StateGraph 协调 MonitorAgent / AnalysisAgent /
-    RecoveryAgent / NotificationAgent 四个专项子 Agent。
+    通过 create_agent 创建主 Agent，绑定 4 个子 Agent 工具，
+    由主 Agent 的 LLM 按 system prompt 引导的流程自主调度子 Agent。
 
     Usage:
         agent = FaultAgent()
@@ -45,25 +64,42 @@ class FaultAgent:
         console_confirm_mode: bool = True,
         enable_audit_log: bool = True,
     ):
-        """
-        初始化 FaultAgent
-
-        Args:
-            console_confirm_mode: RecoveryAgent 危险操作是否使用控制台交互确认
-            enable_audit_log: 是否启用审计日志（传递给各子 Agent）
-        """
         self.console_confirm_mode = console_confirm_mode
         self.enable_audit_log = enable_audit_log
 
+        # 设置 RecoveryAgent 的确认模式
+        set_console_confirm_mode(console_confirm_mode)
+
         self.planner = FaultPlanner()
-        self.short_term_memory = get_short_term_memory()
         self.long_term_memory = get_long_term_memory()
 
+        # 构建主 Agent（checkpointer=InMemorySaver 自动管理对话历史）
+        self._checkpointer = InMemorySaver()
+        self._agent = self._build_agent()
+
+        # 跟踪活跃会话 ID（供 API 会话管理接口使用）
+        self._active_sessions: set = set()
+
         self._init_knowledge_base()
-        logger.info("[FaultAgent] 多 Agent FaultAgent 初始化完成")
+        logger.info("[FaultAgent] 主 Agent 初始化完成")
+
+    def _build_agent(self) -> Any:
+        """构建主 Agent（create_agent + 子 Agent 工具）"""
+        middleware = []
+        if self.enable_audit_log:
+            middleware.append(AuditLogMiddleware())
+
+        return create_agent(
+            model=get_llm(),
+            tools=FAULT_AGENT_TOOLS,
+            system_prompt=_load_prompt(),
+            middleware=middleware,
+            checkpointer=self._checkpointer,
+            name="fault_agent",
+        )
 
     def _init_knowledge_base(self) -> None:
-        """初始化长期记忆知识库（加载 data/ 目录下的 Markdown 文件）"""
+        """初始化长期记忆知识库"""
         try:
             counts = self.long_term_memory.load_knowledge_base()
             logger.info(f"[FaultAgent] 知识库加载完成: {counts}")
@@ -79,20 +115,11 @@ class FaultAgent:
         """
         处理一个故障事件
 
-        完整流程：
+        流程：
         1. FaultPlanner 推断服务名、告警类型、拓扑信息
         2. RAG 检索相关知识
-        3. 构建初始 FaultState
-        4. 调用 StateGraph：monitor → analysis → recovery → notify（含验证回环）
-        5. 从最终 State 提取结果并写入短期记忆
-
-        Args:
-            fault_description: 故障描述文本
-            session_id: 会话 ID（用于短期记忆隔离）
-            fault_id: 故障 ID（不提供则自动生成）
-
-        Returns:
-            处理结果字典（与单 Agent 版本兼容）
+        3. 构建提示并调用主 Agent（主 Agent 自主调度子 Agent 工具）
+        4. 提取处理结果（对话历史由 checkpointer 自动管理）
         """
         ts = datetime.now().strftime("%Y%m%d%H%M%S")
         fault_id = fault_id or f"FAULT-{ts}"
@@ -107,54 +134,44 @@ class FaultAgent:
         # 2. RAG 知识检索
         knowledge_context = self._retrieve_knowledge(plan.knowledge_query)
 
-        # 3. 构建初始 FaultState
-        initial_state = {
-            "fault_id": fault_id,
-            "fault_description": fault_description,
-            "service_name": plan.service_name,
-            "session_id": session_id,
-            "knowledge_context": knowledge_context,
-            "service_node_info": plan.raw_service_info,
-            "alert_type": plan.alert_type.value,
-            "monitoring_results": "",
-            "analysis_result": "",
-            "root_cause": "",
-            "recovery_plan": "",
-            "recovery_actions": "",
-            "is_resolved": False,
-            "notifications_sent": False,
-            "error_message": None,
-            "verify_count": 0,
-            "messages": [],
-        }
+        # 3. 构建主 Agent 输入提示
+        prompt = self._build_prompt(
+            fault_description=fault_description,
+            service_name=plan.service_name,
+            service_node_info=plan.raw_service_info,
+            knowledge_context=knowledge_context,
+            fault_id=fault_id,
+        )
 
-        # 4. 获取 StateGraph 并执行
-        graph = get_fault_graph(console_confirm_mode=self.console_confirm_mode)
+        # 4. 调用主 Agent
         config = RunnableConfig(
-            configurable={"thread_id": session_id},
+            configurable={
+                "thread_id": session_id,
+                "fault_id": fault_id,
+            },
             tags=[f"fault_id:{fault_id}", f"service:{plan.service_name}"],
         )
 
         try:
-            final_state = graph.invoke(initial_state, config=config)
+            result = self._agent.invoke(
+                {"messages": [HumanMessage(content=prompt)]},
+                config=config,
+            )
 
-            # 5. 从最终 State 提取摘要响应
-            response = self._extract_response(final_state)
+            messages = result.get("messages", [])
+            response = self._extract_last_text(messages)
 
-            # 6. 将处理结果写入短期记忆
-            self.short_term_memory.add_user_message(session_id, fault_description)
-            self.short_term_memory.add_ai_message(session_id, response)
+            # 记录活跃会话（对话历史由 checkpointer 自动管理）
+            self._active_sessions.add(session_id)
 
             elapsed = time.time() - start_time
             logger.info(
-                f"[FaultAgent] 故障处理完成 fault_id={fault_id} "
-                f"is_resolved={final_state.get('is_resolved', False)} elapsed={elapsed:.1f}s"
+                f"[FaultAgent] 故障处理完成 fault_id={fault_id} elapsed={elapsed:.1f}s"
             )
 
-            status = "resolved" if final_state.get("is_resolved", False) else "completed"
-            error_message = final_state.get("error_message")
-            if error_message:
-                status = "error"
+            # 从响应文本判断处理状态
+            is_resolved = self._check_status(response)
+            status = "resolved" if is_resolved else "completed"
 
             return {
                 "fault_id": fault_id,
@@ -164,8 +181,7 @@ class FaultAgent:
                 "response": response,
                 "elapsed_seconds": round(elapsed, 1),
                 "status": status,
-                "is_resolved": final_state.get("is_resolved", False),
-                "notifications_sent": final_state.get("notifications_sent", False),
+                "is_resolved": is_resolved,
                 "messages": [{"role": "assistant", "content": response}],
             }
 
@@ -191,19 +207,46 @@ class FaultAgent:
         user_input: str,
     ) -> Dict[str, Any]:
         """
-        继续已有故障处理对话（多轮交互）
+        继续已有故障处理对话
 
-        Args:
-            session_id: 已有的会话 ID
-            user_input: 用户的追加输入
-
-        Returns:
-            处理结果字典
+        checkpointer 根据 thread_id (session_id) 自动恢复之前的对话上下文，
+        无需手动加载历史消息。
         """
         return self.handle_fault(
             fault_description=user_input,
             session_id=session_id,
         )
+
+    def list_sessions(self) -> list:
+        """列出所有活跃会话 ID"""
+        return sorted(self._active_sessions)
+
+    def clear_session(self, session_id: str) -> None:
+        """清除指定会话（从活跃列表中移除）"""
+        self._active_sessions.discard(session_id)
+        logger.info(f"[FaultAgent] 已清除会话 {session_id}")
+
+    def _build_prompt(
+        self,
+        fault_description: str,
+        service_name: str,
+        service_node_info: str,
+        knowledge_context: str,
+        fault_id: str,
+    ) -> str:
+        """构建主 Agent 的输入提示"""
+        return f"""## 故障事件
+- 故障 ID：{fault_id}
+- 服务名称：{service_name}
+- 故障描述：{fault_description}
+
+## 服务依赖信息
+{service_node_info or "（暂无服务拓扑信息）"}
+
+## 知识库参考（RAG 检索结果）
+{knowledge_context or "（无相关知识）"}
+
+请按照工作流程处理这个故障。"""
 
     def _retrieve_knowledge(self, query: str) -> str:
         """从长期记忆检索相关知识"""
@@ -213,38 +256,33 @@ class FaultAgent:
             logger.warning(f"[FaultAgent] 知识库检索失败: {e}")
             return "（知识库检索失败）"
 
-    def _extract_response(self, state: Dict[str, Any]) -> str:
-        """从最终 FaultState 中提取可读的处理摘要"""
-        parts = []
+    @staticmethod
+    def _extract_last_text(messages) -> str:
+        """从消息列表提取最后一条 AI 文本响应"""
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.content:
+                if isinstance(msg.content, str):
+                    return msg.content
+                elif isinstance(msg.content, list):
+                    texts = [
+                        p.get("text", "") for p in msg.content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ]
+                    return "\n".join(texts)
+        return "故障处理流程已完成，请查看详细日志。"
 
-        root_cause = state.get("root_cause", "").strip()
-        if root_cause:
-            parts.append(f"## 根因分析\n{root_cause}")
-
-        recovery_actions = state.get("recovery_actions", "").strip()
-        if recovery_actions:
-            parts.append(f"## 已执行操作\n{recovery_actions}")
-
-        is_resolved = state.get("is_resolved", False)
-        notifications_sent = state.get("notifications_sent", False)
-        error_message = state.get("error_message", "")
-
-        if is_resolved:
-            status_line = "✅ 故障已恢复"
-        elif error_message:
-            status_line = f"⚠️ 处理过程异常：{error_message}"
-        else:
-            status_line = "🔧 故障处理已完成，请持续关注服务状态"
-
-        parts.append(f"## 处理状态\n{status_line}")
-
-        if notifications_sent:
-            parts.append("📢 通知已发送至相关人员")
-
-        if not parts:
-            analysis = state.get("analysis_result", "").strip()
-            if analysis:
-                return analysis
-            return "故障处理流程已完成，请查看详细日志。"
-
-        return "\n\n".join(parts)
+    @staticmethod
+    def _check_status(response: str) -> bool:
+        """从主 Agent 响应文本中判断故障是否已恢复"""
+        text_lower = response.lower()
+        if any(kw in text_lower for kw in ["partial", "failed", "未恢复", "恢复失败", "需人工"]):
+            return False
+        resolved_keywords = ["resolved", "已恢复", "恢复成功", "故障已消除"]
+        for kw in resolved_keywords:
+            if kw in text_lower:
+                negative_prefix = any(
+                    neg + kw in text_lower for neg in ["未", "没有", "尚未", "仍未"]
+                )
+                if not negative_prefix:
+                    return True
+        return False

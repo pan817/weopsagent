@@ -78,7 +78,7 @@ def demo_direct_mode(fault_index: int = 0):
 
     print("初始化 FaultAgent（可能需要一些时间加载知识库）...")
 
-    from agent.fault_agent import FaultAgent
+    from agents.fault_agent import FaultAgent
 
     agent = FaultAgent(
         console_confirm_mode=True,   # 控制台交互确认

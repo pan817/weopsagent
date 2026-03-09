@@ -36,9 +36,7 @@ class TestFaultPlanner:
         assert plan.fault_id == "FAULT-001"
         assert plan.fault_description == "订单服务接口超时"
         assert plan.service_name is not None
-        # alert_type 固定为 UNKNOWN，由下游 Agent 自行判断
         assert plan.alert_type == AlertType.UNKNOWN
-        # knowledge_query 直接使用原始故障描述，保证 RAG 语义准确
         assert plan.knowledge_query == "订单服务接口超时"
 
     def test_format_service_info_with_node(self):
@@ -60,139 +58,6 @@ class TestFaultPlanner:
         assert "未找到" in info or "暂无" in info or len(info) > 0
 
 
-class TestFaultAgent:
-    """FaultAgent 集成测试"""
-
-    @patch("agent.fault_agent.get_long_term_memory")
-    @patch("agent.fault_agent.get_short_term_memory")
-    @patch("agent.fault_agent.FaultPlanner")
-    @patch("agent.fault_agent.create_fault_agent")
-    def test_handle_fault_success(
-        self,
-        mock_create_agent,
-        mock_planner_class,
-        mock_stm,
-        mock_ltm,
-    ):
-        """测试故障处理成功流程"""
-        from agent.fault_agent import FaultAgent
-        from planner.fault_planner import AlertType
-
-        # Mock 规划器
-        mock_plan = MagicMock()
-        mock_plan.fault_id = "FAULT-001"
-        mock_plan.service_name = "order-service"
-        mock_plan.alert_type = AlertType.UNKNOWN
-        mock_plan.raw_service_info = "订单服务在 192.168.1.101"
-        mock_plan.knowledge_query = "订单服务响应慢"
-        mock_planner_class.return_value.create_plan.return_value = mock_plan
-
-        # Mock 短期记忆
-        mock_stm_instance = MagicMock()
-        mock_stm_instance.get_messages.return_value = []
-        mock_stm.return_value = mock_stm_instance
-
-        # Mock 长期记忆
-        mock_ltm_instance = MagicMock()
-        mock_ltm_instance.load_knowledge_base.return_value = {"general": 3, "scenario": 2, "history": 2}
-        mock_ltm_instance.format_context.return_value = "相关知识：检查数据库慢查询"
-        mock_ltm.return_value = mock_ltm_instance
-
-        # Mock Agent 执行
-        from langchain_core.messages import AIMessage
-        mock_agent = MagicMock()
-        mock_agent.invoke.return_value = {
-            "messages": [
-                AIMessage(content="经过分析，订单服务响应缓慢的原因是数据库慢查询。已执行以下操作：...")
-            ]
-        }
-        mock_create_agent.return_value = mock_agent
-
-        # 执行
-        agent = FaultAgent()
-        result = agent.handle_fault("订单服务接口超时，P99 超过 5 秒")
-
-        assert result["status"] in ("completed", "error")
-        assert "fault_id" in result
-        assert "service_name" in result
-        assert "response" in result
-
-    @patch("agent.fault_agent.get_long_term_memory")
-    @patch("agent.fault_agent.get_short_term_memory")
-    @patch("agent.fault_agent.FaultPlanner")
-    @patch("agent.fault_agent.create_fault_agent")
-    def test_handle_fault_permission_denied(
-        self,
-        mock_create_agent,
-        mock_planner_class,
-        mock_stm,
-        mock_ltm,
-    ):
-        """测试危险操作被拒绝时的处理"""
-        from agent.fault_agent import FaultAgent
-        from planner.fault_planner import AlertType
-
-        mock_plan = MagicMock()
-        mock_plan.fault_id = "FAULT-002"
-        mock_plan.service_name = "order-service"
-        mock_plan.alert_type = AlertType.UNKNOWN
-        mock_plan.raw_service_info = ""
-        mock_plan.knowledge_query = ""
-        mock_planner_class.return_value.create_plan.return_value = mock_plan
-
-        mock_stm.return_value.get_messages.return_value = []
-        mock_ltm.return_value.load_knowledge_base.return_value = {}
-        mock_ltm.return_value.format_context.return_value = ""
-
-        # 模拟 Agent 抛出 PermissionError（人工确认被拒绝）
-        mock_agent = MagicMock()
-        mock_agent.invoke.side_effect = PermissionError("危险操作 'restart_service' 被拒绝")
-        mock_create_agent.return_value = mock_agent
-
-        agent = FaultAgent()
-        result = agent.handle_fault("服务宕机，需要重启")
-
-        assert result["status"] == "rejected"
-        assert "拒绝" in result["response"] or "rejected" in result["response"].lower()
-
-    @patch("agent.fault_agent.get_long_term_memory")
-    @patch("agent.fault_agent.get_short_term_memory")
-    @patch("agent.fault_agent.FaultPlanner")
-    @patch("agent.fault_agent.create_fault_agent")
-    def test_handle_fault_exception(
-        self,
-        mock_create_agent,
-        mock_planner_class,
-        mock_stm,
-        mock_ltm,
-    ):
-        """测试 Agent 执行异常时的错误处理"""
-        from agent.fault_agent import FaultAgent
-        from planner.fault_planner import AlertType
-
-        mock_plan = MagicMock()
-        mock_plan.fault_id = "FAULT-003"
-        mock_plan.service_name = "unknown"
-        mock_plan.alert_type = AlertType.UNKNOWN
-        mock_plan.raw_service_info = ""
-        mock_plan.knowledge_query = ""
-        mock_planner_class.return_value.create_plan.return_value = mock_plan
-
-        mock_stm.return_value.get_messages.return_value = []
-        mock_ltm.return_value.load_knowledge_base.return_value = {}
-        mock_ltm.return_value.format_context.return_value = ""
-
-        mock_agent = MagicMock()
-        mock_agent.invoke.side_effect = RuntimeError("LLM API 调用失败")
-        mock_create_agent.return_value = mock_agent
-
-        agent = FaultAgent()
-        result = agent.handle_fault("未知故障")
-
-        assert result["status"] == "error"
-        assert "error" in result
-
-
 class TestMiddleware:
     """Middleware 测试（LangChain 1.2.x AgentMiddleware API）"""
 
@@ -203,7 +68,6 @@ class TestMiddleware:
 
         middleware = AuditLogMiddleware(fault_id="TEST-001")
 
-        # 构造 mock ToolCallRequest
         mock_request = MagicMock()
         mock_request.tool_call = {
             "name": "monitor_redis",
@@ -211,11 +75,9 @@ class TestMiddleware:
             "id": "call-001",
         }
 
-        # mock handler 返回 ToolMessage
         def mock_handler(req):
             return ToolMessage(content='{"connected": true}', tool_call_id="call-001")
 
-        # 不应抛出异常，应返回 ToolMessage
         result = middleware.wrap_tool_call(mock_request, mock_handler)
         assert isinstance(result, ToolMessage)
 
@@ -229,7 +91,6 @@ class TestMiddleware:
         mock_state.messages = [HumanMessage(content="测试故障")]
         mock_runtime = MagicMock()
 
-        # before_agent 和 after_agent 均不应抛出异常
         assert middleware.before_agent(mock_state, mock_runtime) is None
         assert middleware.before_model(mock_state, mock_runtime) is None
         assert middleware.after_model(mock_state, mock_runtime) is None
@@ -248,11 +109,10 @@ class TestMiddleware:
             tool_name="restart_service",
             tool_input={"host": "192.168.1.101", "service_name": "test"},
         )
-        # select 在测试环境可能不支持，结果可能是 APPROVED 或 TIMEOUT
         assert result.status in (ConfirmStatus.APPROVED, ConfirmStatus.TIMEOUT)
 
     def test_non_dangerous_tool_passes_through(self):
-        """测试非危险工具通过 wrap_tool_call 直接放行（不触发确认）"""
+        """测试非危险工具通过 wrap_tool_call 直接放行"""
         from middleware.human_confirm import HumanConfirmMiddleware
         from langchain_core.messages import ToolMessage
 
@@ -260,7 +120,7 @@ class TestMiddleware:
 
         mock_request = MagicMock()
         mock_request.tool_call = {
-            "name": "monitor_redis",  # 非危险工具
+            "name": "monitor_redis",
             "args": {},
             "id": "call-safe-001",
         }
@@ -272,20 +132,18 @@ class TestMiddleware:
             return ToolMessage(content="redis ok", tool_call_id="call-safe-001")
 
         result = middleware.wrap_tool_call(mock_request, mock_handler)
-        # 非危险工具直接透传，handler 应被调用一次
         assert call_count["n"] == 1
         assert isinstance(result, ToolMessage)
 
     def test_dangerous_tool_raises_on_timeout(self):
-        """测试危险工具在无法确认时（超时）抛出 PermissionError"""
+        """测试危险工具在无法确认时抛出 PermissionError"""
         from middleware.human_confirm import HumanConfirmMiddleware
 
-        # 无 console_mode，无 webhook_url → 默认拒绝
         middleware = HumanConfirmMiddleware(console_mode=False, timeout=1)
 
         mock_request = MagicMock()
         mock_request.tool_call = {
-            "name": "restart_service",  # 危险工具
+            "name": "restart_service",
             "args": {"host": "192.168.1.101"},
             "id": "call-danger-001",
         }
@@ -308,7 +166,6 @@ class TestMiddleware:
             comment="已确认，可以重启",
         )
 
-        # 预存的确认结果应被 _request_confirmation 直接读取
         result = middleware._request_confirmation(
             operation_id="op-ext-001",
             tool_name="restart_service",
@@ -363,9 +220,8 @@ class TestAPIServer:
         """测试空故障描述的验证"""
         response = client.post(
             "/api/v1/fault/handle",
-            json={"fault_description": "abc"},  # 太短，少于5个字符会被拒绝？
+            json={"fault_description": "abc"},
         )
-        # 5 个字符是最小值，"abc" 只有 3 个字符
         assert response.status_code in (200, 422)
 
     def test_submit_confirmation(self, client):
@@ -385,23 +241,22 @@ class TestAPIServer:
         assert data["approved"] is True
 
 
-class TestMultiAgentFaultAgent:
-    """多 Agent 架构 FaultAgent 集成测试"""
+class TestFaultAgentIntegration:
+    """主 Agent + 子 Agent 架构集成测试"""
 
-    @patch("agents.fault_agent.get_fault_graph")
+    @patch("agents.fault_agent.create_agent")
     @patch("agents.fault_agent.get_long_term_memory")
-    @patch("agents.fault_agent.get_short_term_memory")
     @patch("agents.fault_agent.FaultPlanner")
     def test_handle_fault_resolved(
         self,
         mock_planner_class,
-        mock_stm,
         mock_ltm,
-        mock_get_graph,
+        mock_create_agent,
     ):
-        """测试多 Agent 流程：故障成功恢复"""
+        """测试主 Agent 流程：故障成功恢复"""
         from agents.fault_agent import FaultAgent
         from planner.fault_planner import AlertType
+        from langchain_core.messages import AIMessage
 
         mock_plan = MagicMock()
         mock_plan.fault_id = "FAULT-MA-001"
@@ -411,47 +266,39 @@ class TestMultiAgentFaultAgent:
         mock_plan.knowledge_query = "订单服务响应慢"
         mock_planner_class.return_value.create_plan.return_value = mock_plan
 
-        mock_stm.return_value.get_messages.return_value = []
         mock_ltm.return_value.load_knowledge_base.return_value = {"general": 3}
         mock_ltm.return_value.format_context.return_value = "相关知识：数据库慢查询处理"
 
-        mock_graph = MagicMock()
-        mock_graph.invoke.return_value = {
-            "fault_id": "FAULT-MA-001",
-            "service_name": "order-service",
-            "is_resolved": True,
-            "root_cause": "数据库连接池耗尽",
-            "recovery_actions": "已扩容连接池至 200",
-            "notifications_sent": True,
-            "error_message": None,
-            "analysis_result": "连接池耗尽导致响应超时",
-            "messages": [],
+        # Mock create_agent 返回的 agent 实例
+        mock_agent_instance = MagicMock()
+        mock_agent_instance.invoke.return_value = {
+            "messages": [
+                AIMessage(content="## 根因分析\n数据库连接池耗尽\n\n## 已执行操作\n已扩容连接池\n\n## 处理状态\n已恢复")
+            ],
         }
-        mock_get_graph.return_value = mock_graph
+        mock_create_agent.return_value = mock_agent_instance
 
         agent = FaultAgent()
         result = agent.handle_fault("订单服务接口超时，P99 超过 5 秒")
 
         assert result["status"] == "resolved"
         assert result["is_resolved"] is True
-        assert result["notifications_sent"] is True
         assert "fault_id" in result
         assert "response" in result
 
-    @patch("agents.fault_agent.get_fault_graph")
+    @patch("agents.fault_agent.create_agent")
     @patch("agents.fault_agent.get_long_term_memory")
-    @patch("agents.fault_agent.get_short_term_memory")
     @patch("agents.fault_agent.FaultPlanner")
     def test_handle_fault_not_resolved(
         self,
         mock_planner_class,
-        mock_stm,
         mock_ltm,
-        mock_get_graph,
+        mock_create_agent,
     ):
-        """测试多 Agent 流程：故障未能完全恢复（验证次数耗尽）"""
+        """测试主 Agent 流程：故障未能完全恢复"""
         from agents.fault_agent import FaultAgent
         from planner.fault_planner import AlertType
+        from langchain_core.messages import AIMessage
 
         mock_plan = MagicMock()
         mock_plan.fault_id = "FAULT-MA-002"
@@ -461,23 +308,16 @@ class TestMultiAgentFaultAgent:
         mock_plan.knowledge_query = "支付服务宕机"
         mock_planner_class.return_value.create_plan.return_value = mock_plan
 
-        mock_stm.return_value.get_messages.return_value = []
         mock_ltm.return_value.load_knowledge_base.return_value = {}
         mock_ltm.return_value.format_context.return_value = ""
 
-        mock_graph = MagicMock()
-        mock_graph.invoke.return_value = {
-            "fault_id": "FAULT-MA-002",
-            "service_name": "payment-service",
-            "is_resolved": False,
-            "root_cause": "硬件故障，需人工介入",
-            "recovery_actions": "已尝试重启，未成功",
-            "notifications_sent": True,
-            "error_message": None,
-            "analysis_result": "",
-            "messages": [],
+        mock_agent_instance = MagicMock()
+        mock_agent_instance.invoke.return_value = {
+            "messages": [
+                AIMessage(content="## 处理状态\nFAILED - 硬件故障，需人工介入")
+            ],
         }
-        mock_get_graph.return_value = mock_graph
+        mock_create_agent.return_value = mock_agent_instance
 
         agent = FaultAgent()
         result = agent.handle_fault("支付服务宕机，无法连接")
@@ -486,18 +326,16 @@ class TestMultiAgentFaultAgent:
         assert result["is_resolved"] is False
         assert result["service_name"] == "payment-service"
 
-    @patch("agents.fault_agent.get_fault_graph")
+    @patch("agents.fault_agent.create_agent")
     @patch("agents.fault_agent.get_long_term_memory")
-    @patch("agents.fault_agent.get_short_term_memory")
     @patch("agents.fault_agent.FaultPlanner")
-    def test_handle_fault_graph_exception(
+    def test_handle_fault_exception(
         self,
         mock_planner_class,
-        mock_stm,
         mock_ltm,
-        mock_get_graph,
+        mock_create_agent,
     ):
-        """测试 StateGraph 执行异常时的错误处理"""
+        """测试主 Agent 执行异常时的错误处理"""
         from agents.fault_agent import FaultAgent
         from planner.fault_planner import AlertType
 
@@ -509,13 +347,12 @@ class TestMultiAgentFaultAgent:
         mock_plan.knowledge_query = ""
         mock_planner_class.return_value.create_plan.return_value = mock_plan
 
-        mock_stm.return_value.get_messages.return_value = []
         mock_ltm.return_value.load_knowledge_base.return_value = {}
         mock_ltm.return_value.format_context.return_value = ""
 
-        mock_graph = MagicMock()
-        mock_graph.invoke.side_effect = RuntimeError("LangGraph 执行失败")
-        mock_get_graph.return_value = mock_graph
+        mock_agent_instance = MagicMock()
+        mock_agent_instance.invoke.side_effect = RuntimeError("Agent 执行失败")
+        mock_create_agent.return_value = mock_agent_instance
 
         agent = FaultAgent()
         result = agent.handle_fault("未知故障")
@@ -524,59 +361,28 @@ class TestMultiAgentFaultAgent:
         assert "error" in result
 
 
-class TestCoordinator:
-    """Coordinator StateGraph 路由逻辑测试"""
+class TestCheckStatus:
+    """FaultAgent._check_status 状态判断测试"""
 
-    def test_route_after_recovery_resolved(self):
-        """测试恢复后路由：已解决 → notify_node"""
-        from agents.coordinator import _route_after_recovery
-        state = {"is_resolved": True, "verify_count": 0}
-        assert _route_after_recovery(state) == "notify_node"
+    def test_resolved(self):
+        from agents.fault_agent import FaultAgent
+        assert FaultAgent._check_status("故障已恢复，服务正常") is True
 
-    def test_route_after_recovery_retry(self):
-        """测试恢复后路由：未解决且未超限 → monitor_node"""
-        from agents.coordinator import _route_after_recovery
-        state = {"is_resolved": False, "verify_count": 0}
-        assert _route_after_recovery(state) == "monitor_node"
+    def test_not_resolved_failed(self):
+        from agents.fault_agent import FaultAgent
+        assert FaultAgent._check_status("FAILED - 需人工介入") is False
 
-    def test_route_after_recovery_max_exceeded(self):
-        """测试恢复后路由：超出验证上限 → notify_node（强制通知）"""
-        from agents.coordinator import _route_after_recovery, MAX_VERIFY_COUNT
-        state = {"is_resolved": False, "verify_count": MAX_VERIFY_COUNT}
-        assert _route_after_recovery(state) == "notify_node"
+    def test_not_resolved_partial(self):
+        from agents.fault_agent import FaultAgent
+        assert FaultAgent._check_status("PARTIAL - 部分恢复") is False
 
-    def test_increment_verify_count(self):
-        """测试验证计数器递增"""
-        from agents.coordinator import _increment_verify_count
-        state = {"verify_count": 1}
-        result = _increment_verify_count(state)
-        assert result["verify_count"] == 2
+    def test_not_resolved_negative(self):
+        from agents.fault_agent import FaultAgent
+        assert FaultAgent._check_status("故障未恢复") is False
 
-    def test_increment_verify_count_initial(self):
-        """测试验证计数器从空状态开始递增"""
-        from agents.coordinator import _increment_verify_count
-        state = {}
-        result = _increment_verify_count(state)
-        assert result["verify_count"] == 1
-
-    def test_build_fault_graph_returns_compiled_graph(self):
-        """测试 build_fault_graph 返回可调用的编译图"""
-        from agents.coordinator import build_fault_graph
-        graph = build_fault_graph(console_confirm_mode=True)
-        assert graph is not None
-        assert callable(graph.invoke)
-
-    def test_get_fault_graph_caches_instance(self):
-        """测试 get_fault_graph 对相同参数返回同一缓存实例"""
-        from agents.coordinator import get_fault_graph, _graph_cache
-        _graph_cache.clear()
-
-        g1 = get_fault_graph(console_confirm_mode=True)
-        g2 = get_fault_graph(console_confirm_mode=True)
-        assert g1 is g2
-
-        g3 = get_fault_graph(console_confirm_mode=False)
-        assert g3 is not g1
+    def test_unknown_status(self):
+        from agents.fault_agent import FaultAgent
+        assert FaultAgent._check_status("处理完成") is False
 
 
 if __name__ == "__main__":

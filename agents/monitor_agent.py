@@ -1,22 +1,25 @@
 """
 监控 Subagent - 全链路状态数据采集
 
-Subagent 设计要点：
-- 编译后的 Agent 实例在进程生命周期内缓存复用，不在每次调用时重建
-- Prompt 从 agents/prompts/monitor_agent.txt 加载，便于维护
-- AuditLogMiddleware 不绑定静态 fault_id，由 RunnableConfig.configurable 动态注入
-- 工具集仅含只读监控工具，无任何危险操作
+作为 @tool 暴露给主 Agent (FaultAgent) 调用。
+主 Agent 调用 run_monitoring tool 时，内部创建并调用 Monitor Subagent，
+由 Subagent 自主选择调用哪些监控工具（monitor_process / analyze_logs / monitor_redis / monitor_mq / monitor_database）。
 
-使用工具：monitor_process / analyze_logs / monitor_redis / monitor_mq / monitor_database
+Subagent 设计要点：
+- 编译后的 Agent 实例在进程生命周期内缓存复用
+- Prompt 从 agents/prompts/monitor_agent.txt 加载
+- 工具集仅含只读监控工具，无任何危险操作
 """
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
+from pydantic import BaseModel, Field
 
 from llm.model import get_llm
 from middleware.audit_log import AuditLogMiddleware
@@ -38,13 +41,7 @@ def _load_prompt() -> str:
 
 
 def _get_agent() -> Any:
-    """
-    获取 Monitor Subagent 编译实例（进程级单例）
-
-    Agent 只在首次调用时编译，后续调用复用同一实例。
-    fault_id 通过 RunnableConfig.configurable["fault_id"] 在调用时动态注入，
-    无需重建 Agent 即可支持多个并发故障处理。
-    """
+    """获取 Monitor Subagent 编译实例（进程级单例）"""
     global _agent
     if _agent is None:
         logger.info("[MonitorAgent] 编译 Monitor Subagent（首次初始化）")
@@ -52,7 +49,6 @@ def _get_agent() -> Any:
             model=get_llm(),
             tools=MONITOR_TOOLS,
             system_prompt=_load_prompt(),
-            # AuditLogMiddleware 不绑定 fault_id，由运行时从 configurable 读取
             middleware=[AuditLogMiddleware()],
             checkpointer=InMemorySaver(),
             name="monitor_agent",
@@ -60,51 +56,32 @@ def _get_agent() -> Any:
     return _agent
 
 
-def run_monitor_node(state: Dict[str, Any], config: RunnableConfig) -> Dict[str, Any]:
-    """
-    监控节点（LangGraph 节点函数）
-
-    从 FaultState 读取服务信息，调用 Monitor Subagent 采集全链路状态，
-    将结果写回 state["monitoring_results"]。
-    """
-    fault_id = state.get("fault_id", "UNKNOWN")
-    service_name = state.get("service_name", "unknown")
-    service_node_info = state.get("service_node_info", "")
-    fault_description = state.get("fault_description", "")
-
-    logger.info(f"[MonitorAgent] 开始监控 service={service_name} fault_id={fault_id}")
-
-    prompt = (
-        f"故障描述：{fault_description}\n\n"
-        f"服务依赖信息：\n{service_node_info}\n\n"
-        f"请对该服务的全链路进行监控，采集所有中间件的运行状态。"
+class MonitorInput(BaseModel):
+    """监控工具输入参数"""
+    task_description: str = Field(
+        description="监控任务描述，包含故障描述、服务依赖信息等，供监控 Agent 据此采集全链路状态"
     )
+
+
+@tool("run_monitoring", args_schema=MonitorInput)
+def run_monitoring(task_description: str) -> str:
+    """调用监控子Agent对故障相关服务进行全链路监控采集，包括进程状态、日志分析、Redis/MQ/数据库等中间件状态。
+    输入为监控任务描述（含故障描述和服务依赖信息），返回全链路监控摘要。"""
+    logger.info("[MonitorAgent] 收到监控任务")
 
     try:
         agent = _get_agent()
         result = agent.invoke(
-            {"messages": [HumanMessage(content=prompt)]},
+            {"messages": [HumanMessage(content=task_description)]},
             config=RunnableConfig(
-                configurable={
-                    "thread_id": f"{fault_id}-monitor",
-                    "fault_id": fault_id,   # 供 AuditLogMiddleware 动态读取
-                },
+                configurable={"thread_id": "monitor-task"},
             ),
         )
         messages = result.get("messages", [])
-        monitoring_results = _extract_last_text(messages)
-        logger.info(f"[MonitorAgent] 监控完成 fault_id={fault_id}")
-
-        return {
-            "monitoring_results": monitoring_results,
-            "messages": messages[-2:] if len(messages) >= 2 else messages,
-        }
+        return _extract_last_text(messages)
     except Exception as e:
-        logger.error(f"[MonitorAgent] 监控失败 fault_id={fault_id}: {e}")
-        return {
-            "monitoring_results": f"监控采集失败: {e}",
-            "error_message": f"MonitorAgent 异常: {e}",
-        }
+        logger.error(f"[MonitorAgent] 监控失败: {e}")
+        return f"监控采集失败: {e}"
 
 
 def _extract_last_text(messages) -> str:

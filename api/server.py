@@ -328,10 +328,9 @@ async def reload_knowledge():
     tags=["会话管理"],
 )
 async def list_sessions():
-    """列出所有活跃的短期记忆会话"""
-    from memory.short_term import get_short_term_memory
-    stm = get_short_term_memory()
-    sessions = stm.list_sessions()
+    """列出所有活跃会话（由 checkpointer 自动管理对话历史）"""
+    agent = get_fault_agent()
+    sessions = agent.list_sessions()
     return {
         "total": len(sessions),
         "sessions": sessions,
@@ -344,10 +343,9 @@ async def list_sessions():
     tags=["会话管理"],
 )
 async def clear_session(session_id: str):
-    """清除指定会话的短期记忆历史"""
-    from memory.short_term import get_short_term_memory
-    stm = get_short_term_memory()
-    stm.clear_session(session_id)
+    """清除指定会话"""
+    agent = get_fault_agent()
+    agent.clear_session(session_id)
     return {"status": "cleared", "session_id": session_id}
 
 

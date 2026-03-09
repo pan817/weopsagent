@@ -7,7 +7,9 @@
       "WebFetch(domain:reference.langchain.com)",
       "WebFetch(domain:pypi.org)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(python3 -c \"import sys, json; lines = sys.stdin.readlines\\(\\); [print\\(json.loads\\(l\\).get\\(''content'', ''''\\)[:500] if isinstance\\(json.loads\\(l\\).get\\(''content''\\), str\\) else ''''\\) for l in lines[-20:]]\")",
+      "Bash(python3 -c \" import sys, json lines = sys.stdin.readlines\\(\\) for line in lines[-30:]: try: obj = json.loads\\(line\\) role = obj.get\\(''role'', ''''\\) content = obj.get\\(''content'', ''''\\) if isinstance\\(content, list\\): for item in content: if isinstance\\(item, dict\\) and item.get\\(''type''\\) == ''text'': print\\(f''[{role}]: {item[\"\"text\"\"][:300]}''\\) elif isinstance\\(content, str\\): print\\(f''[{role}]: {content[:300]}''\\) except: pass \")"
     ]
   }
 }

@@ -8,7 +8,7 @@
 
 移除的功能（方案B+C）：
 - alert_type 关键词分类：分类结果未被任何 Agent 使用，且误分类会污染知识库检索
-- monitoring_steps 构建：生成后从未传入 FaultState，是死代码
+- monitoring_steps 构建：生成后未被使用，是死代码
 """
 import logging
 import re
@@ -27,7 +27,7 @@ class AlertType(str, Enum):
     告警类型枚举（仅用于 API 返回值类型标注，不再做自动分类）
 
     当前所有故障均以 UNKNOWN 处理，由 MonitorAgent + AnalysisAgent 自行推断真实类型。
-    保留此枚举是为了保持 FaultState 和 API 返回结构的向后兼容。
+    保留此枚举是为了保持 API 返回结构的向后兼容。
     """
     UNKNOWN = "unknown"
 
