@@ -1,15 +1,17 @@
 """
-故障规划器模块 - 解析故障描述，加载服务拓扑，制定分析计划
+故障规划器模块 - 使用 LLM 意图识别解析故障描述，加载服务拓扑，制定分析计划
 
-规划器职责（精简版）：
-1. 从故障描述中推断受影响的服务名称
+规划器职责：
+1. 使用 LLM 从故障描述中识别受影响的服务名称和告警类型（结构化输出）
 2. 加载服务的全链路依赖拓扑（service_node/*.md）
-3. 将原始故障描述直接用作知识库检索 query（避免关键词误分类污染 RAG 结果）
+3. 由 LLM 生成优化后的知识库检索 query
 
-移除的功能（方案B+C）：
-- alert_type 关键词分类：分类结果未被任何 Agent 使用，且误分类会污染知识库检索
-- monitoring_steps 构建：生成后未被使用，是死代码
+LLM 意图识别优势（对比旧版关键词匹配）：
+- 自然语言理解：「订单系统偶尔报500」→ service=order-service, alert=http_error
+- 自动适配新服务：只需在 service_node/ 下添加 md 文件，无需维护关键词映射
+- 一次调用同时输出 service_name + alert_type + knowledge_query
 """
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -23,13 +25,23 @@ logger = logging.getLogger(__name__)
 
 
 class AlertType(str, Enum):
-    """
-    告警类型枚举（仅用于 API 返回值类型标注，不再做自动分类）
+    """告警类型枚举，由 LLM 意图识别自动分类"""
+    TIMEOUT = "timeout"                 # 超时类：接口超时、连接超时
+    CONNECTION = "connection"           # 连接类：连接拒绝、连接池耗尽
+    HTTP_ERROR = "http_error"           # HTTP 错误：5xx、4xx
+    OOM = "oom"                         # 内存溢出：OOM、内存不足
+    HIGH_CPU = "high_cpu"               # CPU 过高
+    HIGH_LOAD = "high_load"             # 负载过高
+    DISK_FULL = "disk_full"             # 磁盘满
+    PROCESS_DOWN = "process_down"       # 进程宕机
+    MQ_CONGESTION = "mq_congestion"     # 消息队列堆积
+    SLOW_QUERY = "slow_query"           # 慢查询
+    REPLICATION_LAG = "replication_lag"  # 主从延迟
+    UNKNOWN = "unknown"                 # 无法识别
 
-    当前所有故障均以 UNKNOWN 处理，由 MonitorAgent + AnalysisAgent 自行推断真实类型。
-    保留此枚举是为了保持 API 返回结构的向后兼容。
-    """
-    UNKNOWN = "unknown"
+
+# LLM 可选的告警类型列表（传入 prompt）
+ALERT_TYPE_OPTIONS = ", ".join(t.value for t in AlertType)
 
 
 @dataclass
@@ -52,23 +64,33 @@ class FaultAnalysisPlan:
     fault_id: str
     fault_description: str
     service_name: str
-    alert_type: AlertType          # 固定为 UNKNOWN，由下游 Agent 自行判断
+    alert_type: AlertType
     service_node: Optional[ServiceNode]
-    knowledge_query: str           # 直接使用原始故障描述，不拼接推断字段
+    knowledge_query: str
     raw_service_info: str
 
 
 class FaultPlanner:
     """
-    故障规划器 - 解析故障上下文并制定分析计划
+    故障规划器 - 使用 LLM 意图识别解析故障上下文并制定分析计划
 
-    核心职责：根据故障描述找到对应的服务拓扑配置文件，
-    为后续 Agent 提供准确的主机地址、中间件连接信息等结构化数据。
+    核心流程：
+    1. 预加载 service_node/*.md 构建候选服务列表
+    2. 调用 LLM 做结构化意图识别（服务名 + 告警类型 + 检索 query）
+    3. 匹配服务拓扑，构建完整分析计划
     """
 
     def __init__(self):
         self._service_nodes_cache: Dict[str, ServiceNode] = {}
         self._load_all_service_nodes()
+        self._llm = None  # 延迟初始化
+
+    def _get_llm(self):
+        """延迟获取 LLM 实例"""
+        if self._llm is None:
+            from llm.model import get_llm
+            self._llm = get_llm()
+        return self._llm
 
     def _load_all_service_nodes(self) -> None:
         """预加载所有服务节点配置"""
@@ -161,45 +183,86 @@ class FaultPlanner:
             logger.error(f"[FaultPlanner] 解析服务节点文件失败 {file_path}: {e}")
             return None
 
-    def infer_service_name(self, fault_description: str) -> str:
+    def _build_service_candidates(self) -> str:
+        """构建候选服务列表文本，供 LLM 选择"""
+        if not self._service_nodes_cache:
+            return "（暂无已注册服务）"
+
+        lines = []
+        for name, node in self._service_nodes_cache.items():
+            desc = node.description[:80] if node.description else "无描述"
+            deps = ", ".join(node.dependencies[:5]) if node.dependencies else "无"
+            lines.append(f"- {name}: {desc}（依赖: {deps}）")
+        return "\n".join(lines)
+
+    def _llm_infer(self, fault_description: str) -> Dict[str, str]:
         """
-        从故障描述中推断受影响的服务名称
+        使用 LLM 进行故障意图识别
 
-        先精确匹配已知服务名，再模糊匹配常见服务关键词。
+        一次调用同时输出：
+        - service_name: 受影响的服务名称
+        - alert_type: 告警类型
+        - knowledge_query: 优化后的知识库检索 query
+
+        Returns:
+            解析后的 JSON dict，失败时返回默认值
         """
-        desc_lower = fault_description.lower()
+        candidates = self._build_service_candidates()
 
-        # 精确匹配已知服务名（来自 service_node/*.md 文件名）
-        for service_name in self._service_nodes_cache.keys():
-            if service_name in desc_lower:
-                logger.info(f"[FaultPlanner] 推断服务名: {service_name} (精确匹配)")
-                return service_name
+        prompt = f"""你是一个运维故障分析专家。请根据故障描述，从候选服务列表中识别最可能受影响的服务，判断告警类型，并生成知识库检索关键词。
 
-        # 常见服务名关键词映射
-        service_keywords = {
-            "order": "order-service",
-            "订单": "order-service",
-            "user": "user-service",
-            "用户": "user-service",
-            "payment": "payment-service",
-            "支付": "payment-service",
-            "inventory": "inventory-service",
-            "库存": "inventory-service",
-            "gateway": "api-gateway",
-            "网关": "api-gateway",
-            "auth": "auth-service",
-            "认证": "auth-service",
-            "notification": "notification-service",
-            "通知": "notification-service",
+## 故障描述
+{fault_description}
+
+## 候选服务列表
+{candidates}
+
+## 可选告警类型
+{ALERT_TYPE_OPTIONS}
+
+## 输出要求
+请严格以 JSON 格式返回，不要包含其他内容：
+```json
+{{
+    "service_name": "从候选列表中选择的服务名，如果都不匹配则填 unknown",
+    "alert_type": "从可选告警类型中选择最匹配的一个",
+    "knowledge_query": "用于知识库语义检索的优化 query，提取故障核心关键词，如：订单服务 数据库连接超时 HikariPool"
+}}
+```"""
+
+        try:
+            llm = self._get_llm()
+            response = llm.invoke(prompt)
+            content = response.content if hasattr(response, "content") else str(response)
+
+            # 提取 JSON（兼容 ```json ... ``` 包裹和纯 JSON）
+            json_match = re.search(r"\{[^{}]*\}", content, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                logger.info(
+                    f"[FaultPlanner] LLM 意图识别结果: "
+                    f"service={result.get('service_name')} "
+                    f"alert_type={result.get('alert_type')}"
+                )
+                return result
+
+            logger.warning(f"[FaultPlanner] LLM 返回未包含有效 JSON: {content[:200]}")
+        except Exception as e:
+            logger.error(f"[FaultPlanner] LLM 意图识别失败: {e}")
+
+        # 降级：返回默认值
+        return {
+            "service_name": "unknown",
+            "alert_type": "unknown",
+            "knowledge_query": fault_description,
         }
 
-        for keyword, service in service_keywords.items():
-            if keyword in desc_lower:
-                logger.info(f"[FaultPlanner] 推断服务名: {service} (关键词: {keyword})")
-                return service
-
-        logger.warning("[FaultPlanner] 无法推断服务名，使用 unknown")
-        return "unknown"
+    def _parse_alert_type(self, alert_type_str: str) -> AlertType:
+        """将字符串转换为 AlertType 枚举，无效值返回 UNKNOWN"""
+        try:
+            return AlertType(alert_type_str.lower())
+        except ValueError:
+            return AlertType.UNKNOWN
 
     def get_service_node(self, service_name: str) -> Optional[ServiceNode]:
         """获取服务节点配置"""
@@ -238,7 +301,12 @@ class FaultPlanner:
         fault_description: str,
     ) -> FaultAnalysisPlan:
         """
-        根据故障描述创建分析计划
+        根据故障描述创建分析计划（LLM 意图识别）
+
+        流程：
+        1. 调用 LLM 识别 service_name + alert_type + knowledge_query
+        2. 根据 service_name 加载服务拓扑
+        3. 构建完整分析计划
 
         Args:
             fault_id: 故障唯一 ID
@@ -247,24 +315,28 @@ class FaultPlanner:
         Returns:
             FaultAnalysisPlan: 包含服务拓扑信息和 RAG 检索 query 的分析计划
         """
-        service_name = self.infer_service_name(fault_description)
+        # LLM 意图识别
+        infer_result = self._llm_infer(fault_description)
+
+        service_name = infer_result.get("service_name", "unknown")
+        alert_type = self._parse_alert_type(infer_result.get("alert_type", "unknown"))
+        knowledge_query = infer_result.get("knowledge_query", fault_description)
+
+        # 加载服务拓扑
         service_node = self.get_service_node(service_name)
         service_info = self.format_service_info(service_node)
 
-        # 直接使用原始故障描述作为知识库检索 query
-        # 避免拼接可能错误的 alert_type/service_name 污染 RAG 语义检索
-        knowledge_query = fault_description
-
         logger.info(
             f"[FaultPlanner] 已创建故障分析计划 "
-            f"fault_id={fault_id} service={service_name}"
+            f"fault_id={fault_id} service={service_name} "
+            f"alert_type={alert_type.value}"
         )
 
         return FaultAnalysisPlan(
             fault_id=fault_id,
             fault_description=fault_description,
             service_name=service_name,
-            alert_type=AlertType.UNKNOWN,
+            alert_type=alert_type,
             service_node=service_node,
             knowledge_query=knowledge_query,
             raw_service_info=service_info,
