@@ -47,7 +47,11 @@ class NotificationInput(BaseModel):
     )
 
 
-@tool("send_notification", args_schema=NotificationInput)
+@tool(
+    "send_notification",
+    args_schema=NotificationInput,
+    description="向运维人员发送故障通知消息，支持钉钉、Slack、邮件等多渠道。可用于故障告警、处理进展和恢复通知。",
+)
 def send_notification(
     message: str,
     title: str = "WeOps 故障通知",

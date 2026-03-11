@@ -32,7 +32,11 @@ class DBMonitorInput(BaseModel):
     top_n_slow_queries: int = Field(default=10, description="返回前 N 条慢查询")
 
 
-@tool("monitor_database", args_schema=DBMonitorInput)
+@tool(
+    "monitor_database",
+    args_schema=DBMonitorInput,
+    description="监控 MySQL 数据库运行状态，包括连接池、慢查询、锁等待、InnoDB 缓冲池等。可快速发现数据库性能瓶颈和连接问题。",
+)
 def monitor_database(
     host: str = None,
     port: int = None,

@@ -35,7 +35,11 @@ class StoreKnowledgeInput(BaseModel):
     )
 
 
-@tool("store_knowledge", args_schema=StoreKnowledgeInput)
+@tool(
+    "store_knowledge",
+    args_schema=StoreKnowledgeInput,
+    description="将有效的故障处理措施存入知识库（ChromaDB 长期记忆），记录故障现象、根因和解决方案，供未来类似故障参考。",
+)
 def store_knowledge(
     title: str,
     fault_description: str,

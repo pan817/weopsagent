@@ -115,27 +115,47 @@ def get_tool_registry() -> ToolRegistry:
     获取全局 ToolRegistry 单例（进程级懒加载）
 
     首次调用时自动注册所有内置工具。
+    当 settings.use_mock_tools=True 时，注册 mock 工具（不依赖真实环境）。
     """
     global _registry
     if _registry is None:
+        from config.settings import settings
+
         _registry = ToolRegistry()
 
-        # 监控采集工具（只读，无危险操作）
-        monitor_group = "monitor"
-        _registry.register(monitor_process, groups=[monitor_group])
-        _registry.register(monitor_redis,   groups=[monitor_group])
-        _registry.register(monitor_mq,      groups=[monitor_group])
-        _registry.register(monitor_database, groups=[monitor_group])
-        _registry.register(analyze_logs,    groups=[monitor_group])
+        if settings.use_mock_tools:
+            # Mock 模式：使用假实现，无需 SSH / Redis / MQ / DB
+            from .mock import (
+                mock_monitor_process,
+                mock_monitor_redis,
+                mock_monitor_mq,
+                mock_monitor_database,
+                mock_analyze_logs,
+                mock_restart_service,
+                mock_send_notification,
+                mock_store_knowledge,
+            )
+            import logging
+            logging.getLogger(__name__).info("[ToolRegistry] 使用 Mock 工具（调试模式）")
 
-        # 故障恢复工具（含危险操作）
-        recovery_group = "recovery"
-        _registry.register(restart_service,  groups=[recovery_group])
-        _registry.register(store_knowledge,  groups=[recovery_group])
-
-        # 通知工具
-        notification_group = "notification"
-        _registry.register(send_notification, groups=[notification_group])
+            _registry.register(mock_monitor_process, groups=["monitor"])
+            _registry.register(mock_monitor_redis,   groups=["monitor"])
+            _registry.register(mock_monitor_mq,      groups=["monitor"])
+            _registry.register(mock_monitor_database, groups=["monitor"])
+            _registry.register(mock_analyze_logs,    groups=["monitor"])
+            _registry.register(mock_restart_service,  groups=["recovery"])
+            _registry.register(mock_store_knowledge,  groups=["recovery"])
+            _registry.register(mock_send_notification, groups=["notification"])
+        else:
+            # 真实模式：使用实际工具实现
+            _registry.register(monitor_process, groups=["monitor"])
+            _registry.register(monitor_redis,   groups=["monitor"])
+            _registry.register(monitor_mq,      groups=["monitor"])
+            _registry.register(monitor_database, groups=["monitor"])
+            _registry.register(analyze_logs,    groups=["monitor"])
+            _registry.register(restart_service,  groups=["recovery"])
+            _registry.register(store_knowledge,  groups=["recovery"])
+            _registry.register(send_notification, groups=["notification"])
 
     return _registry
 

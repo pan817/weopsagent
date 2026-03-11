@@ -32,7 +32,11 @@ class ServiceRestartInput(BaseModel):
     post_check_command: str = Field(default=None, description="重启后执行的验证命令（可选）")
 
 
-@tool("restart_service", args_schema=ServiceRestartInput)
+@tool(
+    "restart_service",
+    args_schema=ServiceRestartInput,
+    description="⚠️ 危险操作：通过 SSH 重启远程服务器上的指定服务。支持 systemctl/supervisorctl 自动检测，执行前需人工确认。",
+)
 def restart_service(
     host: str,
     service_name: str,

@@ -23,9 +23,9 @@ class Settings(BaseSettings):
     )
 
     # ===== LLM =====
-    openai_api_key: str = Field(default="", description="OpenAI API Key")
-    openai_api_base: str = Field(default="https://api.openai.com/v1", description="OpenAI API Base URL")
-    openai_model: str = Field(default="gpt-4o", description="OpenAI 模型名称")
+    openai_api_key: str = Field(default="sk-f8a2c8b9c7314bd9ba1e09509bdb4bb4", description="OpenAI API Key")
+    openai_api_base: str = Field(default="https://dashscope.aliyuncs.com/compatible-mode/v1", description="OpenAI API Base URL")
+    openai_model: str = Field(default="qwen3.5-plus", description="OpenAI 模型名称")
     openai_temperature: float = Field(default=0.1, description="LLM Temperature")
     openai_max_tokens: int = Field(default=4096, description="最大 Token 数")
 
@@ -94,6 +94,9 @@ class Settings(BaseSettings):
     ssh_default_user: str = Field(default="ops")
     ssh_default_key_path: str = Field(default="~/.ssh/id_rsa")
     ssh_default_port: int = Field(default=22)
+
+    # ===== Mock Tools =====
+    use_mock_tools: bool = Field(default=True, description="使用 mock 工具（无需真实环境即可调试）")
 
     # ===== Tool Safety =====
     restart_blacklist_hosts: str = Field(default="", description="禁止重启的主机，逗号分隔")

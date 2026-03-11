@@ -50,7 +50,11 @@ class LogAnalyzerInput(BaseModel):
     )
 
 
-@tool("analyze_logs", args_schema=LogAnalyzerInput)
+@tool(
+    "analyze_logs",
+    args_schema=LogAnalyzerInput,
+    description="读取并分析远程服务器上的日志文件，统计 ERROR/WARN/Exception 等报错信息，识别最频繁出现的异常类型和错误样本。",
+)
 def analyze_logs(
     host: str,
     log_path: str,

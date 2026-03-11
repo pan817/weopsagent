@@ -25,7 +25,11 @@ class RedisMonitorInput(BaseModel):
     check_keys_pattern: str = Field(default=None, description="要统计的 Key 匹配模式，如 'session:*'")
 
 
-@tool("monitor_redis", args_schema=RedisMonitorInput)
+@tool(
+    "monitor_redis",
+    args_schema=RedisMonitorInput,
+    description="监控 Redis 服务器运行状态，包括内存使用、连接数、命令统计、慢查询等。可快速判断 Redis 是否存在性能问题或连接异常。",
+)
 def monitor_redis(
     host: str = None,
     port: int = None,

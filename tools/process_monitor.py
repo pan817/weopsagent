@@ -27,7 +27,11 @@ class ProcessMonitorInput(BaseModel):
     username: str = Field(default=None, description="SSH 用户名，默认使用配置值")
 
 
-@tool("monitor_process", args_schema=ProcessMonitorInput)
+@tool(
+    "monitor_process",
+    args_schema=ProcessMonitorInput,
+    description="监控指定服务器上的服务进程状态，检查进程是否在运行、CPU 使用率、内存占用情况。需要提供目标主机 IP 和服务进程名称。",
+)
 def monitor_process(
     host: str,
     service_name: str,

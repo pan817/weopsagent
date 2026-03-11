@@ -28,7 +28,11 @@ class MQMonitorInput(BaseModel):
     vhost: str = Field(default="%2F", description="Virtual Host，默认为 /")
 
 
-@tool("monitor_mq", args_schema=MQMonitorInput)
+@tool(
+    "monitor_mq",
+    args_schema=MQMonitorInput,
+    description="监控 RabbitMQ 消息队列状态，包括队列积压量、消费者数量、消息速率等。可发现消息堆积、消费者掉线等问题。",
+)
 def monitor_mq(
     host: str = None,
     management_port: int = None,
