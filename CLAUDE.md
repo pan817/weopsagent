@@ -102,7 +102,8 @@ def run_monitoring(task_description: str) -> str:
 |------|------|
 | `agents/` | 主 Agent + 子 Agent + prompts |
 | `tools/` | 监控/恢复/通知工具 (ToolRegistry 管理) |
-| `middleware/` | 审计日志 + 人工确认 + 动态模型切换中间件 |
+| `tools/mcp/` | MCP 集成工具 (Prometheus/ES/K8s/DingTalk/PostgreSQL) |
+| `middleware/` | 审计日志 + 人工确认 + 动态模型切换 + 限流 + 对话摘要中间件 |
 | `memory/` | 长期记忆 (ChromaDB RAG)，短期记忆由 checkpointer 自动管理 |
 | `config/` | Pydantic Settings 配置 |
 | `planner/` | 故障规划器 (服务推断 + 拓扑加载) |
@@ -130,6 +131,9 @@ POST   /api/v1/knowledge/reload       # 热加载知识库
 | `AuditLogMiddleware` | 全部 | 审计日志，记录 Agent/LLM/Tool 各阶段 |
 | `HumanConfirmMiddleware` | `wrap_tool_call` | 危险操作人工确认 |
 | `ModelSwitchMiddleware` | `before_model` | 动态切换 LLM 模型 |
+| `RateLimitMiddleware` | `before_model` + `wrap_tool_call` | LLM/工具调用限流 |
+| `SlidingWindowMiddleware` | `before_model` | 滑动窗口裁剪：保留首条输入+最近K条（零LLM开销，默认启用） |
+| `SummarizationMiddleware` | `before_model` | 对话历史过长时调用 LLM 压缩为摘要 |
 
 ### ModelSwitchMiddleware 使用示例
 
@@ -147,13 +151,88 @@ agent = FaultAgent(
 )
 ```
 
+### RateLimitMiddleware 使用示例
+
+```python
+from middleware.rate_limit import RateLimitMiddleware
+
+# 方式 1：通过环境变量配置（推荐）
+# RATE_LIMIT_MODEL_RPM=20
+# RATE_LIMIT_TOOL_RPM=60
+# RATE_LIMIT_STRATEGY=wait
+
+# 方式 2：代码直接创建
+middleware = RateLimitMiddleware(
+    model_rpm=20,                          # LLM 每分钟最多 20 次
+    tool_rpm=60,                           # 工具每分钟总计最多 60 次
+    per_tool_rpm={"monitor_process": 10},  # 单工具独立限流
+    strategy="wait",                       # "wait"=等待令牌恢复 / "reject"=直接拒绝
+    wait_timeout=60.0,                     # wait 策略最大等待秒数
+)
+```
+
+### SlidingWindowMiddleware 使用示例（默认启用）
+
+```python
+from middleware.sliding_window import SlidingWindowMiddleware
+
+# 方式 1：通过环境变量配置（推荐，默认启用）
+# SLIDING_WINDOW_ENABLED=true
+# SLIDING_WINDOW_MAX_MESSAGES=20
+# SLIDING_WINDOW_PRESERVE_RECENT=6
+# SLIDING_WINDOW_PRESERVE_FIRST=true
+
+# 方式 2：代码直接创建
+middleware = SlidingWindowMiddleware(
+    max_messages=20,       # 消息数超过 20 条触发裁剪
+    preserve_recent=6,     # 保留最近 6 条消息
+    preserve_first=True,   # 保留第一条用户输入（故障描述）
+)
+# 裁剪后消息结构: [System...] + [第一条HumanMessage] + [最近6条消息]
+```
+
+**注意：** `SlidingWindowMiddleware` 和 `SummarizationMiddleware` 二选一，
+`sliding_window_enabled=True` 时优先使用滑动窗口（零 LLM 开销）。
+
+### SummarizationMiddleware 使用示例
+
+```python
+from middleware.summarization import SummarizationMiddleware
+
+# 方式 1：通过环境变量配置（推荐，默认启用）
+# SUMMARIZATION_ENABLED=true
+# SUMMARIZATION_MAX_MESSAGES=20
+# SUMMARIZATION_MAX_TOKENS=8000
+# SUMMARIZATION_PRESERVE_RECENT=6
+
+# 方式 2：代码直接创建
+middleware = SummarizationMiddleware(
+    max_messages=20,         # 消息数超过 20 条触发压缩
+    max_tokens=8000,         # Token 估算超过 8000 触发压缩
+    preserve_recent=6,       # 保留最近 6 条消息不压缩
+    summary_model=None,      # None=使用当前 Agent 的模型，也可指定低成本模型
+)
+```
+
 ## 重要注意事项
 
 - **危险工具**: `restart_service` 等需经 `HumanConfirmMiddleware` 人工确认
-- **DANGEROUS_TOOLS 集合**: `{"restart_service", "kill_process", "execute_sql", "flush_redis", "purge_mq_queue"}`
-- **ToolRegistry 分组**: `monitor`(5), `recovery`(2), `notification`(1), `all`(8)
+- **DANGEROUS_TOOLS 集合**: `{"restart_service", "kill_process", "execute_sql", "flush_redis", "purge_mq_queue", "k8s_restart_deployment"}`
+- **ToolRegistry 分组**: `monitor`(5+MCP), `recovery`(2+MCP), `notification`(1+MCP), `mcp`(动态), `all`
 - **短期记忆**: 由 `InMemorySaver` checkpointer 按 `thread_id` 自动管理，无需手工维护
 - **ChromaDB**: 需要 `langchain-chroma` 包（不是 `langchain-community`）
 - **SSH 工具**: 需要 `paramiko` + 有效 SSH 密钥 (`SSH_DEFAULT_KEY_PATH`)
 - **环境变量**: 复制 `.env.example` 为 `.env` 并配置 `OPENAI_API_KEY`
 - **RecoveryAgent 确认模式**: 通过 `set_console_confirm_mode()` 设置（CLI=True, API=False）
+
+## MCP 集成工具
+
+通过环境变量配置连接信息即可启用，工具会自动注入到 ToolRegistry 对应分组。
+
+| MCP Server | 工具名 | 分组 | 启用条件 |
+|-----------|--------|------|---------|
+| Prometheus | `query_prometheus`, `query_prometheus_range` | monitor | `MCP_PROMETHEUS_URL` 非空 |
+| Elasticsearch | `search_logs`, `aggregate_logs` | monitor | `MCP_ELASTICSEARCH_URL` 非空 |
+| Kubernetes | `k8s_get_pods`, `k8s_get_pod_logs`, `k8s_restart_deployment`⚠️, `k8s_describe_resource` | monitor/recovery | `MCP_KUBERNETES_ENABLED=true` |
+| DingTalk | `dingtalk_send_text`, `dingtalk_send_markdown` | notification | `MCP_DINGTALK_WEBHOOK` 非空 |
+| PostgreSQL | `pg_query`, `pg_slow_queries`, `pg_table_info` | monitor | `MCP_POSTGRES_DSN` 非空 |

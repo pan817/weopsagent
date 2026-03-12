@@ -65,6 +65,7 @@ DANGEROUS_TOOLS = {
     "execute_sql",
     "flush_redis",
     "purge_mq_queue",
+    "k8s_restart_deployment",
 }
 
 

@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     )
 
     # ===== LLM =====
-    openai_api_key: str = Field(default="sk-f8a2c8b9c7314bd9ba1e09509bdb4bb4", description="OpenAI API Key")
+    openai_api_key: str = Field(default="sk-f8a2c8b922c7314bd9ba1e09509bdb4bb4", description="OpenAI API Key")
     openai_api_base: str = Field(default="https://dashscope.aliyuncs.com/compatible-mode/v1", description="OpenAI API Base URL")
     openai_model: str = Field(default="qwen3.5-plus", description="OpenAI 模型名称")
     openai_temperature: float = Field(default=0.1, description="LLM Temperature")
@@ -56,6 +56,18 @@ class Settings(BaseSettings):
     # ===== Memory =====
     memory_max_tokens: int = Field(default=4000, description="短期记忆最大 Token 数")
     memory_window_size: int = Field(default=20, description="对话窗口大小")
+
+    # ===== Summarization =====
+    summarization_enabled: bool = Field(default=False, description="是否启用 LLM 摘要压缩（与 sliding_window 二选一）")
+    summarization_max_messages: int = Field(default=20, description="消息数阈值，超过触发压缩")
+    summarization_max_tokens: int = Field(default=8000, description="Token 估算阈值，超过触发压缩")
+    summarization_preserve_recent: int = Field(default=6, description="保留最近 N 条消息不压缩")
+
+    # ===== Sliding Window =====
+    sliding_window_enabled: bool = Field(default=True, description="是否启用滑动窗口记忆裁剪（零 LLM 开销）")
+    sliding_window_max_messages: int = Field(default=20, description="消息总数阈值，超过触发裁剪")
+    sliding_window_preserve_recent: int = Field(default=6, description="保留最近 K 条消息")
+    sliding_window_preserve_first: bool = Field(default=True, description="是否保留第一条用户输入")
 
     # ===== Human Confirmation =====
     human_confirm_timeout: int = Field(default=300, description="人工确认超时秒数")
@@ -97,6 +109,35 @@ class Settings(BaseSettings):
 
     # ===== Mock Tools =====
     use_mock_tools: bool = Field(default=True, description="使用 mock 工具（无需真实环境即可调试）")
+
+    # ===== Rate Limit =====
+    rate_limit_model_rpm: Optional[int] = Field(default=None, description="LLM 每分钟最大调用次数，None 不限流")
+    rate_limit_tool_rpm: Optional[int] = Field(default=None, description="工具每分钟总调用次数上限，None 不限流")
+    rate_limit_strategy: str = Field(default="wait", description="限流策略：wait=等待 / reject=拒绝")
+    rate_limit_wait_timeout: float = Field(default=60.0, description="wait 策略最大等待秒数")
+
+    # ===== MCP: Prometheus =====
+    mcp_prometheus_url: Optional[str] = Field(default=None, description="Prometheus HTTP API 地址，如 http://prometheus:9090")
+    mcp_prometheus_timeout: float = Field(default=30.0, description="Prometheus 查询超时秒数")
+
+    # ===== MCP: Elasticsearch =====
+    mcp_elasticsearch_url: Optional[str] = Field(default=None, description="Elasticsearch HTTP 地址，如 http://elasticsearch:9200")
+    mcp_elasticsearch_user: Optional[str] = Field(default=None, description="Elasticsearch 用户名")
+    mcp_elasticsearch_password: Optional[str] = Field(default=None, description="Elasticsearch 密码")
+    mcp_elasticsearch_timeout: float = Field(default=30.0, description="Elasticsearch 查询超时秒数")
+
+    # ===== MCP: Kubernetes =====
+    mcp_kubernetes_enabled: bool = Field(default=False, description="是否启用 Kubernetes 工具")
+    mcp_kubernetes_api_url: str = Field(default="https://kubernetes.default.svc", description="Kubernetes API Server 地址")
+    mcp_kubernetes_token: Optional[str] = Field(default=None, description="Kubernetes Bearer Token（或 ServiceAccount Token）")
+    mcp_kubernetes_timeout: float = Field(default=30.0, description="Kubernetes API 超时秒数")
+
+    # ===== MCP: DingTalk =====
+    mcp_dingtalk_webhook: Optional[str] = Field(default=None, description="钉钉自定义机器人 Webhook URL")
+    mcp_dingtalk_secret: Optional[str] = Field(default=None, description="钉钉机器人签名密钥（加签模式）")
+
+    # ===== MCP: PostgreSQL =====
+    mcp_postgres_dsn: Optional[str] = Field(default=None, description="PostgreSQL 连接字符串，如 postgresql://user:pass@host:5432/dbname")
 
     # ===== Tool Safety =====
     restart_blacklist_hosts: str = Field(default="", description="禁止重启的主机，逗号分隔")

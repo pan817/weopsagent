@@ -21,8 +21,11 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, Field
 
+from config.settings import settings
 from llm.model import get_llm
 from middleware.audit_log import AuditLogMiddleware
+from middleware.sliding_window import SlidingWindowMiddleware
+from middleware.summarization import SummarizationMiddleware
 from tools import get_tool_registry
 
 logger = logging.getLogger(__name__)
@@ -45,11 +48,24 @@ def _get_agent() -> Any:
     global _agent
     if _agent is None:
         logger.info("[MonitorAgent] 编译 Monitor Subagent（首次初始化）")
+        middleware = [AuditLogMiddleware()]
+        if settings.sliding_window_enabled:
+            middleware.append(SlidingWindowMiddleware(
+                max_messages=settings.sliding_window_max_messages,
+                preserve_recent=settings.sliding_window_preserve_recent,
+                preserve_first=settings.sliding_window_preserve_first,
+            ))
+        elif settings.summarization_enabled:
+            middleware.append(SummarizationMiddleware(
+                max_messages=settings.summarization_max_messages,
+                max_tokens=settings.summarization_max_tokens,
+                preserve_recent=settings.summarization_preserve_recent,
+            ))
         _agent = create_agent(
             model=get_llm(),
             tools=MONITOR_TOOLS,
             system_prompt=_load_prompt(),
-            middleware=[AuditLogMiddleware()],
+            middleware=middleware,
             checkpointer=InMemorySaver(),
             name="monitor_agent",
         )

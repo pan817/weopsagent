@@ -31,6 +31,10 @@ from llm.model import get_llm
 from memory.long_term import get_long_term_memory
 from middleware.audit_log import AuditLogMiddleware
 from middleware.model_switch import ModelSwitchMiddleware, ModelRule
+from middleware.rate_limit import RateLimitMiddleware
+from middleware.sliding_window import SlidingWindowMiddleware
+from middleware.summarization import SummarizationMiddleware
+from middleware.tool_input_fix import ToolInputFixMiddleware
 from planner.fault_planner import FaultPlanner
 
 logger = logging.getLogger(__name__)
@@ -88,13 +92,38 @@ class FaultAgent:
 
     def _build_agent(self) -> Any:
         """构建主 Agent（create_agent + 子 Agent 工具 + 中间件）"""
-        middleware = []
+        from config.settings import settings
+
+        middleware = [ToolInputFixMiddleware()]
         if self.enable_audit_log:
             middleware.append(AuditLogMiddleware())
 
         # 动态模型切换中间件（before_model 阶段根据规则替换模型）
         if self.model_rules:
             middleware.append(ModelSwitchMiddleware(rules=self.model_rules))
+
+        # 限流中间件（before_model + wrap_tool_call 阶段限制调用频率）
+        if settings.rate_limit_model_rpm or settings.rate_limit_tool_rpm:
+            middleware.append(RateLimitMiddleware(
+                model_rpm=settings.rate_limit_model_rpm,
+                tool_rpm=settings.rate_limit_tool_rpm,
+                strategy=settings.rate_limit_strategy,
+                wait_timeout=settings.rate_limit_wait_timeout,
+            ))
+
+        # 短期记忆压缩（二选一：滑动窗口 vs LLM 摘要）
+        if settings.sliding_window_enabled:
+            middleware.append(SlidingWindowMiddleware(
+                max_messages=settings.sliding_window_max_messages,
+                preserve_recent=settings.sliding_window_preserve_recent,
+                preserve_first=settings.sliding_window_preserve_first,
+            ))
+        elif settings.summarization_enabled:
+            middleware.append(SummarizationMiddleware(
+                max_messages=settings.summarization_max_messages,
+                max_tokens=settings.summarization_max_tokens,
+                preserve_recent=settings.summarization_preserve_recent,
+            ))
 
         return create_agent(
             model=get_llm(),

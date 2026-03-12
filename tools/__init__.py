@@ -157,6 +157,36 @@ def get_tool_registry() -> ToolRegistry:
             _registry.register(store_knowledge,  groups=["recovery"])
             _registry.register(send_notification, groups=["notification"])
 
+        # MCP 工具：根据配置动态加载（与 mock/真实模式无关）
+        try:
+            from .mcp import get_mcp_tools
+            mcp_tools = get_mcp_tools()
+            for mcp_tool in mcp_tools:
+                tool_name = mcp_tool.name
+                # 按工具名前缀自动分组
+                if tool_name.startswith("query_prometheus"):
+                    _registry.register(mcp_tool, groups=["monitor", "mcp"])
+                elif tool_name.startswith(("search_logs", "aggregate_logs")):
+                    _registry.register(mcp_tool, groups=["monitor", "mcp"])
+                elif tool_name.startswith("k8s_"):
+                    group = "recovery" if "restart" in tool_name else "monitor"
+                    _registry.register(mcp_tool, groups=[group, "mcp"])
+                elif tool_name.startswith("dingtalk_"):
+                    _registry.register(mcp_tool, groups=["notification", "mcp"])
+                elif tool_name.startswith("pg_"):
+                    _registry.register(mcp_tool, groups=["monitor", "mcp"])
+                else:
+                    _registry.register(mcp_tool, groups=["mcp"])
+            if mcp_tools:
+                import logging
+                logging.getLogger(__name__).info(
+                    f"[ToolRegistry] 已加载 {len(mcp_tools)} 个 MCP 工具: "
+                    f"{[t.name for t in mcp_tools]}"
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"[ToolRegistry] MCP 工具加载失败（将继续运行）: {e}")
+
     return _registry
 
 
