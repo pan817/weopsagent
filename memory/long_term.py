@@ -84,6 +84,8 @@ class LongTermMemory:
                 client=self._chroma_client,
                 collection_name=collection_name,
                 embedding_function=self._embeddings,
+                # 使用 cosine 距离，确保相关性分数归一化到 0~1 范围
+                collection_metadata={"hnsw:space": "cosine"},
             )
         logger.info("[LongTermMemory] 知识库向量存储初始化完成")
 

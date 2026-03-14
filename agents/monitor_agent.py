@@ -13,6 +13,7 @@ Subagent 设计要点：
 """
 import logging
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,7 +25,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm.model import get_llm
+from llm.model import get_sequential_llm
 from middleware.audit_log import AuditLogMiddleware
 from middleware.sliding_window import SlidingWindowMiddleware
 from middleware.summarization import SummarizationMiddleware
@@ -70,7 +71,7 @@ def _get_agent() -> Any:
                     preserve_recent=settings.summarization_preserve_recent,
                 ))
             _agent = create_agent(
-                model=get_llm(),
+                model=get_sequential_llm(),
                 tools=MONITOR_TOOLS,
                 system_prompt=_load_prompt(),
                 middleware=middleware,
@@ -117,12 +118,16 @@ def run_monitoring(task_description: str, config: RunnableConfig) -> str:
 
     try:
         agent = _get_agent()
-        # 使用 fault_id 作为 thread_id，同一故障多次调用共享上下文
-        thread_id = _get_fault_id(config)
+        # 每次调用使用唯一 thread_id，避免因上次递归超限导致 checkpointer
+        # 残留脏 tool_call_id，引发 Qwen 400 错误
+        fault_id = _get_fault_id(config)
+        thread_id = f"{fault_id}-mon-{uuid.uuid4().hex[:8]}"
         result = agent.invoke(
             {"messages": [HumanMessage(content=task_description)]},
             config=RunnableConfig(
                 configurable={"thread_id": thread_id},
+                # 5 个监控工具 × 串行调用，每步约 2 个节点（model+tool），预留 60
+                recursion_limit=60,
             ),
         )
         messages = result.get("messages", [])

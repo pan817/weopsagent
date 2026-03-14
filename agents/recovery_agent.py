@@ -74,10 +74,9 @@ def _get_agent(console_confirm_mode: bool = True) -> Any:
                 f"[RecoveryAgent] 编译 Recovery Subagent "
                 f"console_confirm_mode={console_confirm_mode}（首次初始化）"
             )
-            middleware = [
-                AuditLogMiddleware(),
-                HumanConfirmMiddleware(console_mode=console_confirm_mode),
-            ]
+            middleware = [AuditLogMiddleware()]
+            if settings.human_confirm_enabled:
+                middleware.append(HumanConfirmMiddleware(console_mode=console_confirm_mode))
             if settings.sliding_window_enabled:
                 middleware.append(SlidingWindowMiddleware(
                     max_messages=settings.sliding_window_max_messages,

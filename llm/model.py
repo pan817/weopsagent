@@ -25,8 +25,11 @@ def get_llm() -> ChatOpenAI:
         base_url=settings.openai_api_base,
         temperature=settings.openai_temperature,
         max_tokens=settings.openai_max_tokens,
-        # 支持流式输出
         streaming=False,
+        # 单次请求超时（秒），防止 LLM 服务端挂起导致长时间阻塞
+        request_timeout=settings.openai_request_timeout,
+        # 超时后最多重试次数
+        max_retries=settings.openai_max_retries,
     )
 
 
@@ -44,6 +47,27 @@ def get_llm_with_tools(tools: Sequence[BaseTool]) -> BaseChatModel:
     return llm.bind_tools(tools)
 
 
+@lru_cache(maxsize=1)
+def get_sequential_llm() -> ChatOpenAI:
+    """获取禁用并行工具调用的 LLM 实例（用于 ReAct 串行循环的 sub-agent）
+
+    Qwen3 在并行 tool_calls 场景下，若消息历史中存在未完整收尾的 tool_call_id，
+    会返回 400 错误。通过 model_kwargs 传递 parallel_tool_calls=False，
+    强制模型每轮只返回一个工具调用，与 Thought→Action→Observation 模式完全匹配。
+    """
+    return ChatOpenAI(
+        model=settings.openai_model,
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_api_base,
+        temperature=settings.openai_temperature,
+        max_tokens=settings.openai_max_tokens,
+        streaming=False,
+        request_timeout=settings.openai_request_timeout,
+        max_retries=settings.openai_max_retries,
+        model_kwargs={"parallel_tool_calls": False},
+    )
+
+
 def get_streaming_llm() -> ChatOpenAI:
     """获取支持流式输出的 LLM 实例"""
     return ChatOpenAI(
@@ -53,4 +77,6 @@ def get_streaming_llm() -> ChatOpenAI:
         temperature=settings.openai_temperature,
         max_tokens=settings.openai_max_tokens,
         streaming=True,
+        request_timeout=settings.openai_request_timeout,
+        max_retries=settings.openai_max_retries,
     )

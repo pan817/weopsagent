@@ -23,11 +23,13 @@ class Settings(BaseSettings):
     )
 
     # ===== LLM =====
-    openai_api_key: str = Field(default="sk-f8a2c8b922c7314bd9ba1e09509bdb4bb4", description="OpenAI API Key")
+    openai_api_key: str = Field(default="", description="OpenAI API Key")
     openai_api_base: str = Field(default="https://dashscope.aliyuncs.com/compatible-mode/v1", description="OpenAI API Base URL")
     openai_model: str = Field(default="qwen3.5-plus", description="OpenAI 模型名称")
     openai_temperature: float = Field(default=0.1, description="LLM Temperature")
     openai_max_tokens: int = Field(default=4096, description="最大 Token 数")
+    openai_request_timeout: int = Field(default=60, description="单次 LLM 请求超时秒数，防止服务端挂起")
+    openai_max_retries: int = Field(default=2, description="LLM 请求超时后最大重试次数")
 
     # ===== Vector DB =====
     chroma_persist_dir: str = Field(default="./chroma_db", description="ChromaDB 持久化目录")
@@ -78,6 +80,7 @@ class Settings(BaseSettings):
     sliding_window_preserve_first: bool = Field(default=True, description="是否保留第一条用户输入")
 
     # ===== Human Confirmation =====
+    human_confirm_enabled: bool = Field(default=True, description="是否启用危险操作人工确认，False 则跳过确认直接执行")
     human_confirm_timeout: int = Field(default=300, description="人工确认超时秒数")
     human_confirm_webhook_url: Optional[str] = Field(default=None, description="人工确认 Webhook URL")
 
