@@ -33,12 +33,20 @@ class StoreKnowledgeInput(BaseModel):
         default="confirmed",
         description="有效性: confirmed（已确认有效）, partial（部分有效）"
     )
+    service: str = Field(
+        default="",
+        description="故障所属服务名称，如 'order-service'，用于精确索引"
+    )
+    alert_type: str = Field(
+        default="",
+        description="告警类型，如 'db_connection'、'high_cpu'，用于热点缓存索引"
+    )
 
 
 @tool(
     "store_knowledge",
     args_schema=StoreKnowledgeInput,
-    description="将有效的故障处理措施存入知识库（ChromaDB 长期记忆），记录故障现象、根因和解决方案，供未来类似故障参考。",
+    description="将有效的故障处理措施存入知识库，记录故障现象、根因和解决方案，供未来类似故障参考。",
 )
 def store_knowledge(
     title: str,
@@ -48,13 +56,17 @@ def store_knowledge(
     category: str = "history",
     tags: str = "",
     effectiveness: str = "confirmed",
+    service: str = "",
+    alert_type: str = "",
 ) -> str:
     """将有效的故障处理措施存入知识库（长期记忆），用于未来类似故障的参考。在故障成功处理后应调用此工具保存经验。"""
     start_time = time.time()
     try:
         # 延迟导入避免循环依赖
-        from memory import LongTermMemory
+        from memory.long_term import LongTermMemory
+        from memory.memory_manager import get_memory_manager
 
+        # L3 ChromaDB 写入（同步，持久化兜底层）
         ltm = LongTermMemory()
         doc_id = ltm.store_fault_experience(
             title=title,
@@ -65,6 +77,20 @@ def store_knowledge(
             tags=tags,
             effectiveness=effectiveness,
         )
+
+        # L2/L1 异步写入（Judge 评分 → ES → Redis，不阻塞主流程）
+        get_memory_manager().store_async({
+            "doc_id": doc_id,
+            "title": title,
+            "fault_description": fault_description,
+            "root_cause": root_cause,
+            "solution": solution,
+            "category": category,
+            "tags": [t.strip() for t in tags.split(",") if t.strip()],
+            "effectiveness": effectiveness,
+            "service": service,
+            "alert_type": alert_type,
+        })
 
         elapsed = time.time() - start_time
         logger.info(f"[StoreKnowledge] 已存储处理措施到知识库: {title} (id={doc_id})")

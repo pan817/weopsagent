@@ -22,6 +22,7 @@
     agent = create_agent(..., middleware=[middleware])
 """
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
@@ -78,14 +79,16 @@ class ModelSwitchMiddleware(AgentMiddleware):
         self.rules = rules or []
         self.default_model = default_model
         self._call_index: int = 0
+        self._lock = threading.Lock()
         # 缓存已创建的 ChatOpenAI 实例，避免重复创建
         self._model_cache: dict = {}
         self._current_model_name: Optional[str] = None
 
     def before_agent(self, state: Any, runtime: Any) -> Any:
         """Agent 循环开始时重置调用计数器"""
-        self._call_index = 0
-        self._current_model_name = None
+        with self._lock:
+            self._call_index = 0
+            self._current_model_name = None
         return None
 
     def before_model(self, state: Any, runtime: Any) -> Any:
@@ -95,29 +98,31 @@ class ModelSwitchMiddleware(AgentMiddleware):
         检查所有规则，首条匹配的规则决定使用哪个模型。
         通过修改 runtime.model 实现运行时模型切换。
         """
-        self._call_index += 1
+        with self._lock:
+            self._call_index += 1
+            call_index = self._call_index
 
-        # 逐条匹配规则
-        target_model = self._match_rule(state, runtime)
+            # 逐条匹配规则
+            target_model = self._match_rule(state, runtime)
 
-        if not target_model and self.default_model:
-            target_model = self.default_model
+            if not target_model and self.default_model:
+                target_model = self.default_model
 
-        if not target_model:
-            return None
+            if not target_model:
+                return None
 
-        # 与当前模型相同则跳过
-        if target_model == self._current_model_name:
-            return None
+            # 与当前模型相同则跳过
+            if target_model == self._current_model_name:
+                return None
 
-        # 切换模型
-        model_instance = self._get_or_create_model(target_model)
-        runtime.model = model_instance
-        self._current_model_name = target_model
+            # 切换模型
+            model_instance = self._get_or_create_model(target_model)
+            runtime.model = model_instance
+            self._current_model_name = target_model
 
         logger.info(
             f"[ModelSwitch] 切换模型 → {target_model} "
-            f"(call_index={self._call_index})"
+            f"(call_index={call_index})"
         )
         return None
 

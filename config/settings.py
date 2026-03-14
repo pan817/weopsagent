@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     api_host: str = Field(default="0.0.0.0", description="API 监听地址")
     api_port: int = Field(default=8080, description="API 监听端口")
     api_debug: bool = Field(default=False, description="调试模式")
+    api_auth_token: Optional[str] = Field(
+        default=None,
+        description="API 认证 Token（Bearer Token），为空则拒绝所有需认证请求",
+    )
+    api_cors_origins: str = Field(
+        default="*",
+        description="允许的 CORS 来源，逗号分隔，如 'https://app.example.com,http://localhost:3000'",
+    )
 
     # ===== Memory =====
     memory_max_tokens: int = Field(default=4000, description="短期记忆最大 Token 数")
@@ -138,6 +146,25 @@ class Settings(BaseSettings):
 
     # ===== MCP: PostgreSQL =====
     mcp_postgres_dsn: Optional[str] = Field(default=None, description="PostgreSQL 连接字符串，如 postgresql://user:pass@host:5432/dbname")
+
+    # ===== Memory: LLM Judge (质量门控) =====
+    memory_judge_enabled: bool = Field(default=True, description="是否启用 LLM 质量评估门控（评分 >= 阈值才写入 ES/Redis）")
+    memory_judge_model: str = Field(default="", description="质量评估使用的 LLM 模型，空则复用 openai_model")
+    memory_judge_score_threshold: float = Field(default=0.7, description="质量评分阈值（0-1），低于此值不写入 ES/Redis")
+
+    # ===== Memory: Redis Cache (L1, 默认关闭) =====
+    memory_redis_enabled: bool = Field(default=False, description="是否启用 Redis 热点知识缓存（L1）")
+    memory_redis_url: str = Field(default="redis://localhost:6379/1", description="Redis 连接 URL")
+    memory_redis_ttl: int = Field(default=604800, description="Redis 缓存 TTL 秒数，默认 7 天")
+    memory_redis_hit_threshold: int = Field(default=3, description="文档被命中多少次后提升为热点缓存")
+
+    # ===== Memory: Elasticsearch (L2, 默认关闭) =====
+    memory_es_enabled: bool = Field(default=False, description="是否启用 Elasticsearch 结构化检索（L2）")
+    memory_es_url: str = Field(default="http://localhost:9200", description="Elasticsearch 地址")
+    memory_es_user: Optional[str] = Field(default=None, description="Elasticsearch 用户名")
+    memory_es_password: Optional[str] = Field(default=None, description="Elasticsearch 密码")
+    memory_es_index: str = Field(default="weops_knowledge", description="Elasticsearch 索引名")
+    memory_es_score_threshold: float = Field(default=0.6, description="ES 检索相关度阈值，低于此值降级到 L3")
 
     # ===== Tool Safety =====
     restart_blacklist_hosts: str = Field(default="", description="禁止重启的主机，逗号分隔")

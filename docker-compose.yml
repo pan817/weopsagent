@@ -1,0 +1,52 @@
+# ============================================================
+# WeOps Agent - Docker Compose 部署配置
+# ============================================================
+# 启动:   docker compose up -d
+# 查看日志: docker compose logs -f weops-agent
+# 停止:   docker compose down
+# ============================================================
+
+services:
+  weops-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: weops-agent
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8080}:8080"
+    env_file:
+      - .env
+    volumes:
+      # 持久化 ChromaDB 向量数据库和日志
+      - chroma_data:/app/chroma_db
+      - log_data:/app/logs
+      # 知识库热更新：挂载本地 data/ 目录
+      - ./data:/app/data:ro
+      # 服务拓扑热更新
+      - ./service_node:/app/service_node:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  chroma_data:
+    driver: local
+  log_data:
+    driver: local

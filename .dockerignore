@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+dist
+build
+
+# Virtual environment
+.venv
+venv
+env
+
+# Local data (will be mounted as volumes)
+chroma_db/
+logs/
+
+# Development files
+.env
+.claude/
+tests/
+scripts/
+spec.md
+CLAUDE.md
+pytest.ini
+
+# OS files
+.DS_Store
+Thumbs.db

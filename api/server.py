@@ -10,19 +10,46 @@ FastAPI HTTP 服务 - 提供故障处理 API 接口
 - POST /api/v1/knowledge/reload - 重新加载知识库
 """
 import logging
+import secrets
+import threading
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# ===== 认证机制 =====
+
+_security = HTTPBearer()
+
+
+async def verify_token(
+    credentials: HTTPAuthorizationCredentials = Depends(_security),
+) -> str:
+    """
+    Bearer Token 认证依赖
+
+    从请求头 Authorization: Bearer <token> 中提取 token 并校验。
+    使用 secrets.compare_digest 防止时序攻击。
+    """
+    if not settings.api_auth_token:
+        raise HTTPException(
+            status_code=503,
+            detail="API 认证未配置，请设置 API_AUTH_TOKEN 环境变量",
+        )
+    if not secrets.compare_digest(credentials.credentials, settings.api_auth_token):
+        logger.warning(f"[API] 认证失败: 无效的 Token")
+        raise HTTPException(status_code=401, detail="无效的认证 Token")
+    return credentials.credentials
 
 # ===== 请求/响应 Schema =====
 
@@ -85,24 +112,72 @@ class HealthResponse(BaseModel):
 
 # ===== 应用生命周期 =====
 
-# 全局 Agent 实例（懒加载）
+# 全局 Agent 实例（懒加载，线程安全）
 _fault_agent = None
-# 待确认操作缓存 {operation_id: middleware_instance}
+_agent_lock = threading.Lock()
+# 待确认操作缓存 {operation_id: {data..., _stored_at: timestamp}}
 _pending_confirms: Dict[str, Any] = {}
-# 异步任务结果缓存 {fault_id: result}
+_confirms_lock = threading.Lock()
+_CONFIRM_TTL = 600  # 确认结果保留 10 分钟
+_CONFIRM_MAX_SIZE = 100
+
+# 异步任务结果缓存 {fault_id: (result, timestamp)}
 _task_results: Dict[str, Dict] = {}
+_results_lock = threading.Lock()
+# 任务结果最大保留时间（秒）和最大条目数
+_RESULT_TTL = 3600
+_RESULT_MAX_SIZE = 500
+
+
+def _cleanup_task_results() -> None:
+    """清理过期的异步任务结果（需在 _results_lock 内调用）"""
+    now = time.time()
+    expired = [
+        fid for fid, entry in _task_results.items()
+        if now - entry.get("_stored_at", 0) > _RESULT_TTL
+    ]
+    for fid in expired:
+        del _task_results[fid]
+    # 超过最大条目数时，移除最旧的
+    if len(_task_results) > _RESULT_MAX_SIZE:
+        sorted_items = sorted(
+            _task_results.items(), key=lambda x: x[1].get("_stored_at", 0)
+        )
+        for fid, _ in sorted_items[:len(_task_results) - _RESULT_MAX_SIZE]:
+            del _task_results[fid]
+
+
+def _cleanup_pending_confirms() -> None:
+    """清理过期的确认结果（需在 _confirms_lock 内调用）"""
+    now = time.time()
+    expired = [
+        oid for oid, entry in _pending_confirms.items()
+        if now - entry.get("timestamp", 0) > _CONFIRM_TTL
+    ]
+    for oid in expired:
+        del _pending_confirms[oid]
+    if len(_pending_confirms) > _CONFIRM_MAX_SIZE:
+        sorted_items = sorted(
+            _pending_confirms.items(), key=lambda x: x[1].get("timestamp", 0)
+        )
+        for oid, _ in sorted_items[:len(_pending_confirms) - _CONFIRM_MAX_SIZE]:
+            del _pending_confirms[oid]
 
 
 def get_fault_agent():
-    """获取全局 FaultAgent 单例（懒加载）"""
+    """获取全局 FaultAgent 单例（懒加载，线程安全）"""
     global _fault_agent
-    if _fault_agent is None:
-        from agents.fault_agent import FaultAgent
-        _fault_agent = FaultAgent(
-            console_confirm_mode=False,  # 生产环境使用 API 确认模式
-            enable_audit_log=True,
-        )
-        logger.info("[API] FaultAgent 初始化完成")
+    if _fault_agent is not None:
+        return _fault_agent
+    with _agent_lock:
+        # 双重检查锁定
+        if _fault_agent is None:
+            from agents.fault_agent import FaultAgent
+            _fault_agent = FaultAgent(
+                console_confirm_mode=False,
+                enable_audit_log=True,
+            )
+            logger.info("[API] FaultAgent 初始化完成")
     return _fault_agent
 
 
@@ -129,10 +204,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 跨域配置
+# 跨域配置（从环境变量读取允许的来源）
+_cors_origins = [
+    o.strip() for o in settings.api_cors_origins.split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -168,6 +246,7 @@ async def health_check():
     summary="提交故障处理请求",
     description="接收故障描述，Agent 自动分析并处理故障。支持同步和异步两种模式。",
     tags=["故障处理"],
+    dependencies=[Depends(verify_token)],
 )
 async def handle_fault(
     request: FaultHandleRequest,
@@ -194,7 +273,10 @@ async def handle_fault(
                 fault_id=fault_id,
                 session_id=request.session_id,
             )
-            _task_results[fault_id] = result
+            result["_stored_at"] = time.time()
+            with _results_lock:
+                _task_results[fault_id] = result
+                _cleanup_task_results()
 
         background_tasks.add_task(_run_async)
 
@@ -227,6 +309,7 @@ async def handle_fault(
     summary="继续故障处理对话",
     description="在已有故障处理 session 基础上，继续追加问题或指令。",
     tags=["故障处理"],
+    dependencies=[Depends(verify_token)],
 )
 async def continue_fault(request: FaultContinueRequest):
     """
@@ -250,14 +333,20 @@ async def continue_fault(request: FaultContinueRequest):
     "/api/v1/fault/{fault_id}/status",
     summary="查询故障处理状态",
     tags=["故障处理"],
+    dependencies=[Depends(verify_token)],
 )
 async def get_fault_status(fault_id: str):
     """查询异步故障处理任务的状态和结果"""
-    if fault_id in _task_results:
+    with _results_lock:
+        _cleanup_task_results()
+        entry = _task_results.get(fault_id)
+    if entry is not None:
+        # 返回结果时移除内部字段
+        result = {k: v for k, v in entry.items() if not k.startswith("_")}
         return {
             "fault_id": fault_id,
-            "status": _task_results[fault_id].get("status", "completed"),
-            "result": _task_results[fault_id],
+            "status": result.get("status", "completed"),
+            "result": result,
         }
     return {
         "fault_id": fault_id,
@@ -271,6 +360,7 @@ async def get_fault_status(fault_id: str):
     summary="提交人工确认结果",
     description="对 Agent 提出的危险操作（如服务重启）进行人工审批。",
     tags=["人工确认"],
+    dependencies=[Depends(verify_token)],
 )
 async def submit_confirmation(request: ConfirmRequest):
     """
@@ -284,10 +374,16 @@ async def submit_confirmation(request: ConfirmRequest):
     - **operator**: 操作员名称
     - **comment**: 备注
     """
-    # 获取人工确认中间件实例并提交结果
-    from middleware.human_confirm import HumanConfirmMiddleware
     # 注意：在生产环境中，需要通过某种机制将确认结果传递给等待中的中间件实例
     # 这里简单记录确认结果，实际场景可用 Redis 或数据库存储
+    with _confirms_lock:
+        _cleanup_pending_confirms()
+        _pending_confirms[request.operation_id] = {
+            "approved": request.approved,
+            "operator": request.operator,
+            "comment": request.comment,
+            "timestamp": time.time(),
+        }
     logger.info(
         f"[API] 收到人工确认: operation_id={request.operation_id} "
         f"approved={request.approved} operator={request.operator}"
@@ -306,6 +402,7 @@ async def submit_confirmation(request: ConfirmRequest):
     summary="重新加载知识库",
     description="重新扫描 data/ 目录，加载最新的 Markdown 知识文件到向量数据库。",
     tags=["知识库管理"],
+    dependencies=[Depends(verify_token)],
 )
 async def reload_knowledge():
     """重新加载知识库（热更新）"""
@@ -326,6 +423,7 @@ async def reload_knowledge():
     "/api/v1/sessions",
     summary="列出所有活跃会话",
     tags=["会话管理"],
+    dependencies=[Depends(verify_token)],
 )
 async def list_sessions():
     """列出所有活跃会话（由 checkpointer 自动管理对话历史）"""
@@ -341,6 +439,7 @@ async def list_sessions():
     "/api/v1/sessions/{session_id}",
     summary="清除会话历史",
     tags=["会话管理"],
+    dependencies=[Depends(verify_token)],
 )
 async def clear_session(session_id: str):
     """清除指定会话"""

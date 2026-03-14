@@ -9,12 +9,14 @@ Subagent 设计要点：
 - 编译后的 Agent 实例在进程生命周期内缓存复用
 - Prompt 从 agents/prompts/notification_agent.txt 加载
 - 根据通知内容自动选择通知类型（告警/恢复/升级）
+- 记忆按 fault_id 隔离，同一故障多次调用共享上下文
 
 使用工具：send_notification
 """
 import logging
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
@@ -34,8 +36,11 @@ logger = logging.getLogger(__name__)
 
 NOTIFY_TOOLS = get_tool_registry().get_group("notification")
 
-# ===== 单例缓存 =====
+# ===== 单例缓存（线程安全）=====
 _agent: Any = None
+_agent_lock = threading.Lock()
+# 模块级 checkpointer，按 fault_id 隔离会话，支持外部清理
+_checkpointer = InMemorySaver()
 
 
 def _load_prompt() -> str:
@@ -45,32 +50,57 @@ def _load_prompt() -> str:
 
 
 def _get_agent() -> Any:
-    """获取 Notification Subagent 编译实例（进程级单例）"""
+    """获取 Notification Subagent 编译实例（进程级单例，线程安全）"""
     global _agent
-    if _agent is None:
-        logger.info("[NotificationAgent] 编译 Notification Subagent（首次初始化）")
-        middleware = [AuditLogMiddleware()]
-        if settings.sliding_window_enabled:
-            middleware.append(SlidingWindowMiddleware(
-                max_messages=settings.sliding_window_max_messages,
-                preserve_recent=settings.sliding_window_preserve_recent,
-                preserve_first=settings.sliding_window_preserve_first,
-            ))
-        elif settings.summarization_enabled:
-            middleware.append(SummarizationMiddleware(
-                max_messages=settings.summarization_max_messages,
-                max_tokens=settings.summarization_max_tokens,
-                preserve_recent=settings.summarization_preserve_recent,
-            ))
-        _agent = create_agent(
-            model=get_llm(),
-            tools=NOTIFY_TOOLS,
-            system_prompt=_load_prompt(),
-            middleware=middleware,
-            checkpointer=InMemorySaver(),
-            name="notification_agent",
-        )
+    if _agent is not None:
+        return _agent
+    with _agent_lock:
+        if _agent is None:
+            logger.info("[NotificationAgent] 编译 Notification Subagent（首次初始化）")
+            middleware = [AuditLogMiddleware()]
+            if settings.sliding_window_enabled:
+                middleware.append(SlidingWindowMiddleware(
+                    max_messages=settings.sliding_window_max_messages,
+                    preserve_recent=settings.sliding_window_preserve_recent,
+                    preserve_first=settings.sliding_window_preserve_first,
+                ))
+            elif settings.summarization_enabled:
+                middleware.append(SummarizationMiddleware(
+                    max_messages=settings.summarization_max_messages,
+                    max_tokens=settings.summarization_max_tokens,
+                    preserve_recent=settings.summarization_preserve_recent,
+                ))
+            _agent = create_agent(
+                model=get_llm(),
+                tools=NOTIFY_TOOLS,
+                system_prompt=_load_prompt(),
+                middleware=middleware,
+                checkpointer=_checkpointer,
+                name="notification_agent",
+            )
     return _agent
+
+
+def purge_thread(thread_id: str) -> None:
+    """清理指定 fault_id 对应的 checkpointer 数据，由 FaultAgent 在会话清理时调用"""
+    try:
+        storage = getattr(_checkpointer, "storage", None)
+        if storage is not None and isinstance(storage, dict):
+            keys_to_remove = [k for k in storage if k[0] == thread_id]
+            for k in keys_to_remove:
+                del storage[k]
+    except Exception as e:
+        logger.debug(f"[NotificationAgent] 清理 checkpointer 失败: {e}")
+
+
+def _get_fault_id(config: Optional[RunnableConfig]) -> str:
+    """从 RunnableConfig 中提取 fault_id 作为 thread_id"""
+    if config:
+        configurable = config.get("configurable", {})
+        fault_id = configurable.get("fault_id")
+        if fault_id:
+            return fault_id
+    return "notify-task-default"
 
 
 class NotificationInput(BaseModel):
@@ -81,17 +111,19 @@ class NotificationInput(BaseModel):
 
 
 @tool("run_notification", args_schema=NotificationInput)
-def run_notification(task_description: str) -> str:
+def run_notification(task_description: str, config: RunnableConfig) -> str:
     """调用通知子Agent发送故障相关通知，支持DingTalk/Slack/Email等渠道。
     输入为通知任务描述（含故障信息和处理状态），返回通知发送结果。"""
     logger.info("[NotificationAgent] 收到通知任务")
 
     try:
         agent = _get_agent()
+        # 使用 fault_id 作为 thread_id，同一故障多次调用共享上下文
+        thread_id = _get_fault_id(config)
         result = agent.invoke(
             {"messages": [HumanMessage(content=task_description)]},
             config=RunnableConfig(
-                configurable={"thread_id": "notify-task"},
+                configurable={"thread_id": thread_id},
             ),
         )
         messages = result.get("messages", [])

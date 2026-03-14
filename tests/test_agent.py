@@ -19,15 +19,17 @@ class TestFaultPlanner:
         from planner.fault_planner import FaultPlanner
         self.planner = FaultPlanner()
 
-    def test_infer_service_name_order(self):
-        """测试从描述中推断订单服务名"""
-        service = self.planner.infer_service_name("订单服务接口报错，500 错误率增加")
-        assert "order" in service.lower() or service == "unknown"
+    def test_llm_infer_order(self):
+        """测试从描述中推断订单服务（LLM 意图识别，失败时降级为 unknown）"""
+        result = self.planner._llm_infer("订单服务接口报错，500 错误率增加")
+        assert "service_name" in result
+        assert isinstance(result["service_name"], str)
 
-    def test_infer_service_name_user(self):
-        """测试从描述中推断用户服务名"""
-        service = self.planner.infer_service_name("用户登录接口响应超时")
-        assert "user" in service.lower() or service == "unknown"
+    def test_llm_infer_user(self):
+        """测试从描述中推断用户服务（LLM 意图识别，失败时降级为 unknown）"""
+        result = self.planner._llm_infer("用户登录接口响应超时")
+        assert "service_name" in result
+        assert isinstance(result["service_name"], str)
 
     def test_create_plan_returns_correct_structure(self):
         """测试创建计划返回正确结构"""
@@ -180,10 +182,18 @@ class TestAPIServer:
 
     @pytest.fixture
     def client(self):
-        """创建测试客户端"""
+        """创建测试客户端（设置测试用 auth token）"""
         from fastapi.testclient import TestClient
         from api.server import app
+        from config.settings import settings
+        # 设置测试用 token
+        settings.api_auth_token = "test-token-for-unit-tests"
         return TestClient(app)
+
+    @pytest.fixture
+    def auth_headers(self):
+        """认证请求头"""
+        return {"Authorization": "Bearer test-token-for-unit-tests"}
 
     def test_health_check(self, client):
         """测试健康检查接口"""
@@ -192,8 +202,25 @@ class TestAPIServer:
         data = response.json()
         assert data["status"] == "ok"
 
+    def test_no_token_returns_401_or_403(self, client):
+        """测试无 Token 请求被拒绝（HTTPBearer 返回 403 或 401）"""
+        response = client.post(
+            "/api/v1/fault/handle",
+            json={"fault_description": "订单服务接口超时"},
+        )
+        assert response.status_code in (401, 403)
+
+    def test_wrong_token_returns_401(self, client):
+        """测试错误 Token 被拒绝"""
+        response = client.post(
+            "/api/v1/fault/handle",
+            json={"fault_description": "订单服务接口超时"},
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert response.status_code == 401
+
     @patch("api.server.get_fault_agent")
-    def test_handle_fault_sync(self, mock_get_agent, client):
+    def test_handle_fault_sync(self, mock_get_agent, client, auth_headers):
         """测试同步故障处理接口"""
         mock_agent = MagicMock()
         mock_agent.handle_fault.return_value = {
@@ -210,21 +237,23 @@ class TestAPIServer:
         response = client.post(
             "/api/v1/fault/handle",
             json={"fault_description": "订单服务接口超时"},
+            headers=auth_headers,
         )
         assert response.status_code == 200
         data = response.json()
         assert data["fault_id"] == "FAULT-TEST"
         assert data["service_name"] == "order-service"
 
-    def test_handle_fault_empty_description(self, client):
+    def test_handle_fault_empty_description(self, client, auth_headers):
         """测试空故障描述的验证"""
         response = client.post(
             "/api/v1/fault/handle",
             json={"fault_description": "abc"},
+            headers=auth_headers,
         )
         assert response.status_code in (200, 422)
 
-    def test_submit_confirmation(self, client):
+    def test_submit_confirmation(self, client, auth_headers):
         """测试人工确认接口"""
         response = client.post(
             "/api/v1/confirm",
@@ -234,6 +263,7 @@ class TestAPIServer:
                 "operator": "admin",
                 "comment": "确认重启",
             },
+            headers=auth_headers,
         )
         assert response.status_code == 200
         data = response.json()

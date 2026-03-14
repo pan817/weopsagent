@@ -23,6 +23,7 @@
 """
 import json
 import logging
+import threading
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from langchain.agents.middleware.types import AgentMiddleware
@@ -56,6 +57,7 @@ class ToolInputFixMiddleware(AgentMiddleware):
         self.auto_coerce = auto_coerce
         self.strip_extra = strip_extra
         self.max_retries = max_retries
+        self._lock = threading.Lock()
         # {tool_name: consecutive_error_count}
         self._error_counts: Dict[str, int] = {}
         # 统计
@@ -64,18 +66,21 @@ class ToolInputFixMiddleware(AgentMiddleware):
 
     def before_agent(self, state: Any, runtime: Any) -> Any:
         """Agent 循环开始时重置计数器"""
-        self._error_counts.clear()
-        self._total_fixed = 0
-        self._total_rejected = 0
+        with self._lock:
+            self._error_counts.clear()
+            self._total_fixed = 0
+            self._total_rejected = 0
         return None
 
     def after_agent(self, state: Any, runtime: Any) -> Any:
         """Agent 循环结束时输出统计"""
-        if self._total_fixed > 0 or self._total_rejected > 0:
+        with self._lock:
+            fixed, rejected = self._total_fixed, self._total_rejected
+        if fixed > 0 or rejected > 0:
             logger.info(
                 f"[ToolInputFix] 统计: "
-                f"自动修正={self._total_fixed} 次, "
-                f"返回错误提示={self._total_rejected} 次"
+                f"自动修正={fixed} 次, "
+                f"返回错误提示={rejected} 次"
             )
         return None
 
@@ -108,7 +113,9 @@ class ToolInputFixMiddleware(AgentMiddleware):
             return handler(request)
 
         # 检查连续错误次数，防止死循环
-        if self._error_counts.get(tool_name, 0) >= self.max_retries:
+        with self._lock:
+            error_count = self._error_counts.get(tool_name, 0)
+        if error_count >= self.max_retries:
             logger.warning(
                 f"[ToolInputFix] {tool_name} 连续参数错误超过 {self.max_retries} 次，跳过修正"
             )
@@ -121,7 +128,8 @@ class ToolInputFixMiddleware(AgentMiddleware):
             logger.info(
                 f"[ToolInputFix] {tool_name} 参数已自动修正: {fixes_applied}"
             )
-            self._total_fixed += 1
+            with self._lock:
+                self._total_fixed += 1
             # 更新 request 中的参数
             tool_call["args"] = fixed_args
 
@@ -130,13 +138,15 @@ class ToolInputFixMiddleware(AgentMiddleware):
             args_schema.model_validate(fixed_args)
         except Exception as e:
             # 验证失败，返回错误提示让 LLM 重试
-            self._error_counts[tool_name] = self._error_counts.get(tool_name, 0) + 1
-            self._total_rejected += 1
+            with self._lock:
+                self._error_counts[tool_name] = self._error_counts.get(tool_name, 0) + 1
+                self._total_rejected += 1
+                err_count = self._error_counts[tool_name]
 
             error_msg = self._build_error_message(tool_name, fixed_args, args_schema, e)
             logger.warning(
                 f"[ToolInputFix] {tool_name} 参数验证失败 "
-                f"(第 {self._error_counts[tool_name]} 次): {e}"
+                f"(第 {err_count} 次): {e}"
             )
 
             return ToolMessage(
@@ -145,15 +155,17 @@ class ToolInputFixMiddleware(AgentMiddleware):
             )
 
         # 验证通过，重置错误计数
-        self._error_counts[tool_name] = 0
+        with self._lock:
+            self._error_counts[tool_name] = 0
 
         # 执行工具（仍然 try/catch，处理运行时参数错误）
         try:
             return handler(request)
         except (TypeError, ValueError) as e:
             # 运行时参数错误（如函数签名不匹配），返回提示
-            self._error_counts[tool_name] = self._error_counts.get(tool_name, 0) + 1
-            self._total_rejected += 1
+            with self._lock:
+                self._error_counts[tool_name] = self._error_counts.get(tool_name, 0) + 1
+                self._total_rejected += 1
 
             error_msg = (
                 f"工具 {tool_name} 执行时参数错误: {type(e).__name__}: {e}\n"

@@ -13,6 +13,7 @@ system prompt 引导标准工作流程。
     └── run_notification → NotificationAgent (子Agent，通知发送)
 """
 import logging
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -24,11 +25,15 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agents.monitor_agent import run_monitoring
+from agents.monitor_agent import purge_thread as monitor_purge_thread
 from agents.analysis_agent import run_analysis
+from agents.analysis_agent import purge_thread as analysis_purge_thread
 from agents.recovery_agent import run_recovery, set_console_confirm_mode
+from agents.recovery_agent import purge_thread as recovery_purge_thread
 from agents.notification_agent import run_notification
+from agents.notification_agent import purge_thread as notification_purge_thread
 from llm.model import get_llm
-from memory.long_term import get_long_term_memory
+from memory.memory_manager import get_memory_manager
 from middleware.audit_log import AuditLogMiddleware
 from middleware.model_switch import ModelSwitchMiddleware, ModelRule
 from middleware.rate_limit import RateLimitMiddleware
@@ -78,14 +83,19 @@ class FaultAgent:
         set_console_confirm_mode(console_confirm_mode)
 
         self.planner = FaultPlanner()
-        self.long_term_memory = get_long_term_memory()
+        self.memory_manager = get_memory_manager()
 
         # 构建主 Agent（checkpointer=InMemorySaver 自动管理对话历史）
         self._checkpointer = InMemorySaver()
         self._agent = self._build_agent()
 
-        # 跟踪活跃会话 ID（供 API 会话管理接口使用）
-        self._active_sessions: set = set()
+        # 跟踪活跃会话 {session_id: last_active_timestamp}（线程安全）
+        self._active_sessions: Dict[str, float] = {}
+        self._sessions_lock = threading.Lock()
+        # 会话过期时间（秒），默认 2 小时
+        self._session_ttl: float = 7200.0
+        # 最大会话数量，超过时清理最旧的会话
+        self._max_sessions: int = 200
 
         self._init_knowledge_base()
         logger.info("[FaultAgent] 主 Agent 初始化完成")
@@ -137,7 +147,7 @@ class FaultAgent:
     def _init_knowledge_base(self) -> None:
         """初始化长期记忆知识库"""
         try:
-            counts = self.long_term_memory.load_knowledge_base()
+            counts = self.memory_manager._chroma.load_knowledge_base()
             logger.info(f"[FaultAgent] 知识库加载完成: {counts}")
         except Exception as e:
             logger.warning(f"[FaultAgent] 知识库加载失败（将继续运行）: {e}")
@@ -167,8 +177,12 @@ class FaultAgent:
         # 1. 故障规划
         plan = self.planner.create_plan(fault_id, fault_description)
 
-        # 2. RAG 知识检索
-        knowledge_context = self._retrieve_knowledge(plan.knowledge_query)
+        # 2. 三级知识检索（L1 Redis → L2 ES → L3 ChromaDB）
+        knowledge_context = self._retrieve_knowledge(
+            plan.knowledge_query,
+            service_name=plan.service_name,
+            alert_type=plan.alert_type.value,
+        )
 
         # 3. 构建主 Agent 输入提示
         prompt = self._build_prompt(
@@ -197,8 +211,10 @@ class FaultAgent:
             messages = result.get("messages", [])
             response = self._extract_last_text(messages)
 
-            # 记录活跃会话（对话历史由 checkpointer 自动管理）
-            self._active_sessions.add(session_id)
+            # 记录活跃会话并清理过期会话
+            with self._sessions_lock:
+                self._active_sessions[session_id] = time.time()
+                self._cleanup_expired_sessions()
 
             elapsed = time.time() - start_time
             logger.info(
@@ -255,12 +271,73 @@ class FaultAgent:
 
     def list_sessions(self) -> list:
         """列出所有活跃会话 ID"""
-        return sorted(self._active_sessions)
+        with self._sessions_lock:
+            self._cleanup_expired_sessions()
+            return sorted(self._active_sessions.keys())
 
     def clear_session(self, session_id: str) -> None:
-        """清除指定会话（从活跃列表中移除）"""
-        self._active_sessions.discard(session_id)
+        """清除指定会话（从活跃列表和 checkpointer 中移除）"""
+        with self._sessions_lock:
+            self._active_sessions.pop(session_id, None)
+        # 尝试清理 checkpointer 中的会话数据
+        self._purge_checkpointer_thread(session_id)
         logger.info(f"[FaultAgent] 已清除会话 {session_id}")
+
+    def _purge_checkpointer_thread(self, thread_id: str) -> None:
+        """从主 Agent 和所有子 Agent 的 InMemorySaver 中删除指定 thread 的检查点数据"""
+        # 清理主 Agent checkpointer
+        try:
+            storage = getattr(self._checkpointer, "storage", None)
+            if storage is not None and isinstance(storage, dict):
+                keys_to_remove = [
+                    k for k in storage if k[0] == thread_id
+                ]
+                for k in keys_to_remove:
+                    del storage[k]
+        except Exception as e:
+            logger.debug(f"[FaultAgent] 清理主 Agent checkpointer 失败: {e}")
+
+        # 清理所有子 Agent 的 checkpointer（子 Agent 以 fault_id 作为 thread_id）
+        for purge_fn in (
+            monitor_purge_thread,
+            analysis_purge_thread,
+            recovery_purge_thread,
+            notification_purge_thread,
+        ):
+            try:
+                purge_fn(thread_id)
+            except Exception as e:
+                logger.debug(f"[FaultAgent] 清理子 Agent checkpointer 失败: {e}")
+
+    def _cleanup_expired_sessions(self) -> None:
+        """清理过期会话（需在 _sessions_lock 内调用）"""
+        now = time.time()
+        expired = [
+            sid for sid, ts in self._active_sessions.items()
+            if now - ts > self._session_ttl
+        ]
+        for sid in expired:
+            del self._active_sessions[sid]
+            # 异步清理 checkpointer 避免在锁内做 IO
+            threading.Thread(
+                target=self._purge_checkpointer_thread,
+                args=(sid,),
+                daemon=True,
+            ).start()
+
+        # 如果超过最大会话数，移除最旧的
+        if len(self._active_sessions) > self._max_sessions:
+            sorted_sessions = sorted(
+                self._active_sessions.items(), key=lambda x: x[1]
+            )
+            excess = len(self._active_sessions) - self._max_sessions
+            for sid, _ in sorted_sessions[:excess]:
+                del self._active_sessions[sid]
+                threading.Thread(
+                    target=self._purge_checkpointer_thread,
+                    args=(sid,),
+                    daemon=True,
+                ).start()
 
     def _build_prompt(
         self,
@@ -284,10 +361,19 @@ class FaultAgent:
 
 请按照工作流程处理这个故障。"""
 
-    def _retrieve_knowledge(self, query: str) -> str:
-        """从长期记忆检索相关知识"""
+    def _retrieve_knowledge(
+        self,
+        query: str,
+        service_name: str = "",
+        alert_type: str = "",
+    ) -> str:
+        """三级级联知识检索（L1 Redis → L2 ES → L3 ChromaDB）"""
         try:
-            return self.long_term_memory.format_context(query, top_k=6)
+            return self.memory_manager.search(
+                query,
+                service=service_name or None,
+                alert_type=alert_type or None,
+            )
         except Exception as e:
             logger.warning(f"[FaultAgent] 知识库检索失败: {e}")
             return "（知识库检索失败）"

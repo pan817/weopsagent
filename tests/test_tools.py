@@ -19,29 +19,24 @@ class TestProcessMonitorTool:
 
     def test_tool_name_and_description(self):
         """测试工具名称和描述"""
-        from tools.process_monitor import ProcessMonitorTool
-        tool = ProcessMonitorTool()
-        assert tool.name == "monitor_process"
-        assert len(tool.description) > 10
+        from tools.process_monitor import monitor_process
+        assert monitor_process.name == "monitor_process"
+        assert len(monitor_process.description) > 10
 
     @patch("tools.process_monitor.paramiko.SSHClient")
     def test_run_process_running(self, mock_ssh_class):
         """测试进程运行时的监控结果"""
-        from tools.process_monitor import ProcessMonitorTool
+        from tools.process_monitor import monitor_process
 
-        # 模拟 SSH 连接和命令执行
         mock_ssh = MagicMock()
         mock_ssh_class.return_value = mock_ssh
 
-        # 模拟 pgrep 输出（进程存在）
         mock_stdout1 = MagicMock()
         mock_stdout1.read.return_value = b"1234 /usr/bin/java -jar order-service.jar"
 
-        # 模拟 ps aux 输出
         mock_stdout2 = MagicMock()
         mock_stdout2.read.return_value = b"cpu=15.2% mem=8.5% count=2"
 
-        # 模拟 uptime 和 free 输出
         mock_stdout3 = MagicMock()
         mock_stdout3.read.return_value = b"load average: 0.5, 0.4, 0.3\nmem_total=8192MB mem_used=4096MB mem_free=4096MB"
 
@@ -51,8 +46,7 @@ class TestProcessMonitorTool:
             (None, mock_stdout3, MagicMock()),
         ]
 
-        tool = ProcessMonitorTool()
-        result_str = tool._run(host="192.168.1.101", service_name="order-service")
+        result_str = monitor_process.invoke({"host": "192.168.1.101", "service_name": "order-service"})
         result = json.loads(result_str)
 
         assert result["success"] is True
@@ -63,12 +57,11 @@ class TestProcessMonitorTool:
     @patch("tools.process_monitor.paramiko.SSHClient")
     def test_run_process_not_running(self, mock_ssh_class):
         """测试进程不存在时的监控结果"""
-        from tools.process_monitor import ProcessMonitorTool
+        from tools.process_monitor import monitor_process
 
         mock_ssh = MagicMock()
         mock_ssh_class.return_value = mock_ssh
 
-        # 模拟 pgrep 返回空（进程不存在）
         mock_stdout1 = MagicMock()
         mock_stdout1.read.return_value = b""
 
@@ -80,8 +73,7 @@ class TestProcessMonitorTool:
             (None, mock_stdout3, MagicMock()),
         ]
 
-        tool = ProcessMonitorTool()
-        result_str = tool._run(host="192.168.1.101", service_name="order-service")
+        result_str = monitor_process.invoke({"host": "192.168.1.101", "service_name": "order-service"})
         result = json.loads(result_str)
 
         assert result["success"] is True
@@ -90,14 +82,13 @@ class TestProcessMonitorTool:
     @patch("tools.process_monitor.paramiko.SSHClient")
     def test_ssh_connection_failure(self, mock_ssh_class):
         """测试 SSH 连接失败时的错误处理"""
-        from tools.process_monitor import ProcessMonitorTool
+        from tools.process_monitor import monitor_process
 
         mock_ssh = MagicMock()
         mock_ssh_class.return_value = mock_ssh
         mock_ssh.connect.side_effect = Exception("Connection refused")
 
-        tool = ProcessMonitorTool()
-        result_str = tool._run(host="192.168.1.999", service_name="test-service")
+        result_str = monitor_process.invoke({"host": "192.168.1.999", "service_name": "test-service"})
         result = json.loads(result_str)
 
         assert result["success"] is False
@@ -109,15 +100,14 @@ class TestRedisMonitorTool:
 
     def test_tool_attributes(self):
         """测试工具属性"""
-        from tools.redis_monitor import RedisMonitorTool
-        tool = RedisMonitorTool()
-        assert tool.name == "monitor_redis"
-        assert "Redis" in tool.description
+        from tools.redis_monitor import monitor_redis
+        assert monitor_redis.name == "monitor_redis"
+        assert "Redis" in monitor_redis.description
 
-    @patch("tools.redis_monitor.redis.Redis")
+    @patch("redis.Redis")
     def test_redis_normal_state(self, mock_redis_class):
         """测试 Redis 正常状态的监控"""
-        from tools.redis_monitor import RedisMonitorTool
+        from tools.redis_monitor import monitor_redis
 
         mock_redis = MagicMock()
         mock_redis_class.return_value = mock_redis
@@ -146,8 +136,7 @@ class TestRedisMonitorTool:
         mock_redis.slowlog_get.return_value = []
         mock_redis.dbsize.return_value = 100000
 
-        tool = RedisMonitorTool()
-        result_str = tool._run(host="192.168.1.150", port=6379)
+        result_str = monitor_redis.invoke({"host": "192.168.1.150", "port": 6379})
         result = json.loads(result_str)
 
         assert result["success"] is True
@@ -155,17 +144,16 @@ class TestRedisMonitorTool:
         assert result["data"]["server_version"] == "7.0.0"
         assert result["data"]["total_keys"] == 100000
 
-    @patch("tools.redis_monitor.redis.Redis")
+    @patch("redis.Redis")
     def test_redis_connection_failure(self, mock_redis_class):
         """测试 Redis 连接失败"""
-        from tools.redis_monitor import RedisMonitorTool
+        from tools.redis_monitor import monitor_redis
 
         mock_redis = MagicMock()
         mock_redis_class.return_value = mock_redis
         mock_redis.ping.side_effect = ConnectionError("Connection refused")
 
-        tool = RedisMonitorTool()
-        result_str = tool._run(host="192.168.1.999")
+        result_str = monitor_redis.invoke({"host": "192.168.1.999"})
         result = json.loads(result_str)
 
         assert result["success"] is False
@@ -178,7 +166,7 @@ class TestLogAnalyzerTool:
     @patch("tools.log_analyzer.paramiko.SSHClient")
     def test_analyze_logs_with_errors(self, mock_ssh_class):
         """测试有错误的日志分析"""
-        from tools.log_analyzer import LogAnalyzerTool
+        from tools.log_analyzer import analyze_logs
 
         mock_ssh = MagicMock()
         mock_ssh_class.return_value = mock_ssh
@@ -207,11 +195,10 @@ class TestLogAnalyzerTool:
             (None, mock_stdout_du, MagicMock()),
         ]
 
-        tool = LogAnalyzerTool()
-        result_str = tool._run(
-            host="192.168.1.101",
-            log_path="/var/log/order-service/app.log",
-        )
+        result_str = analyze_logs.invoke({
+            "host": "192.168.1.101",
+            "log_path": "/var/log/order-service/app.log",
+        })
         result = json.loads(result_str)
 
         assert result["success"] is True
@@ -222,7 +209,7 @@ class TestLogAnalyzerTool:
     @patch("tools.log_analyzer.paramiko.SSHClient")
     def test_file_not_found(self, mock_ssh_class):
         """测试日志文件不存在的情况"""
-        from tools.log_analyzer import LogAnalyzerTool
+        from tools.log_analyzer import analyze_logs
 
         mock_ssh = MagicMock()
         mock_ssh_class.return_value = mock_ssh
@@ -230,10 +217,12 @@ class TestLogAnalyzerTool:
         mock_stdout = MagicMock()
         mock_stdout.read.return_value = b"FILE_NOT_FOUND"
 
-        mock_ssh.exec_command.return_value = (None, mock_stdout, MagicMock())
+        mock_stderr = MagicMock()
+        mock_stderr.read.return_value = b""
 
-        tool = LogAnalyzerTool()
-        result_str = tool._run(host="192.168.1.101", log_path="/nonexistent/app.log")
+        mock_ssh.exec_command.return_value = (None, mock_stdout, mock_stderr)
+
+        result_str = analyze_logs.invoke({"host": "192.168.1.101", "log_path": "/nonexistent/app.log"})
         result = json.loads(result_str)
 
         assert result["success"] is True  # 工具执行成功，但文件不存在
@@ -245,15 +234,14 @@ class TestNotificationTool:
 
     def test_tool_attributes(self):
         """测试工具属性"""
-        from tools.notification import NotificationTool
-        tool = NotificationTool()
-        assert tool.name == "send_notification"
-        assert len(tool.description) > 10
+        from tools.notification import send_notification
+        assert send_notification.name == "send_notification"
+        assert len(send_notification.description) > 10
 
     @patch("tools.notification.httpx.Client")
     def test_dingtalk_notification_success(self, mock_client_class):
         """测试钉钉通知成功"""
-        from tools.notification import NotificationTool
+        from tools.notification import send_notification
         from config.settings import settings
 
         mock_resp = MagicMock()
@@ -266,17 +254,15 @@ class TestNotificationTool:
         mock_client.post.return_value = mock_resp
         mock_client_class.return_value = mock_client
 
-        # 临时设置 dingtalk webhook
         original = settings.notify_dingtalk_webhook
         settings.notify_dingtalk_webhook = "https://oapi.dingtalk.com/robot/send?access_token=test"
 
-        tool = NotificationTool()
-        result_str = tool._run(
-            message="订单服务已恢复正常",
-            title="WeOps 恢复通知",
-            severity="recovery",
-            channels=["dingtalk"],
-        )
+        result_str = send_notification.invoke({
+            "message": "订单服务已恢复正常",
+            "title": "WeOps 恢复通知",
+            "severity": "recovery",
+            "channels": ["dingtalk"],
+        })
         result = json.loads(result_str)
 
         settings.notify_dingtalk_webhook = original
@@ -286,10 +272,9 @@ class TestNotificationTool:
 
     def test_no_channels_configured(self):
         """测试无通知渠道时的处理"""
-        from tools.notification import NotificationTool
+        from tools.notification import send_notification
         from config.settings import settings
 
-        # 临时清空所有通知渠道
         original_dd = settings.notify_dingtalk_webhook
         original_slack = settings.notify_slack_webhook
         original_smtp = settings.notify_email_smtp_host
@@ -297,11 +282,9 @@ class TestNotificationTool:
         settings.notify_slack_webhook = None
         settings.notify_email_smtp_host = None
 
-        tool = NotificationTool()
-        result_str = tool._run(message="test", channels=None)
+        result_str = send_notification.invoke({"message": "test"})
         result = json.loads(result_str)
 
-        # 恢复配置
         settings.notify_dingtalk_webhook = original_dd
         settings.notify_slack_webhook = original_slack
         settings.notify_email_smtp_host = original_smtp
@@ -314,15 +297,13 @@ class TestServiceRestartTool:
 
     def test_blacklist_protection(self):
         """测试黑名单保护机制"""
-        from tools.service_restart import ServiceRestartTool
+        from tools.service_restart import restart_service
         from config.settings import settings
 
-        # 设置黑名单
         original = settings.restart_blacklist_hosts
         settings.restart_blacklist_hosts = "192.168.1.100,192.168.1.200"
 
-        tool = ServiceRestartTool()
-        result_str = tool._run(host="192.168.1.100", service_name="critical-service")
+        result_str = restart_service.invoke({"host": "192.168.1.100", "service_name": "critical-service"})
         result = json.loads(result_str)
 
         settings.restart_blacklist_hosts = original
@@ -332,10 +313,9 @@ class TestServiceRestartTool:
 
     def test_tool_name(self):
         """测试工具名称（用于危险操作识别）"""
-        from tools.service_restart import ServiceRestartTool
-        tool = ServiceRestartTool()
+        from tools.service_restart import restart_service
         # 必须与 DANGEROUS_TOOLS 中的名称一致
-        assert tool.name == "restart_service"
+        assert restart_service.name == "restart_service"
 
 
 class TestToolBase:

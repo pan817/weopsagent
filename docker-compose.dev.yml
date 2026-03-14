@@ -1,0 +1,93 @@
+# ============================================================
+# WeOps Agent - 开发环境（含外部依赖服务）
+# ============================================================
+# 启动:   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# 仅依赖: docker compose -f docker-compose.dev.yml up -d redis mysql rabbitmq
+# ============================================================
+
+services:
+  weops-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - API_DEBUG=true
+      - USE_MOCK_TOOLS=false
+      - LOG_LEVEL=DEBUG
+      # 连接开发环境依赖
+      - MONITOR_REDIS_HOST=redis
+      - MONITOR_REDIS_PORT=6379
+      - MONITOR_DB_HOST=mysql
+      - MONITOR_DB_PORT=3306
+      - MONITOR_DB_USER=readonly_user
+      - MONITOR_DB_PASSWORD=readonly_pass
+      - MONITOR_DB_NAME=production
+      - MONITOR_MQ_HOST=rabbitmq
+      - MONITOR_MQ_PORT=5672
+      - MONITOR_MQ_MANAGEMENT_PORT=15672
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: weops-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - redis_data:/data
+
+  mysql:
+    image: mysql:8.0
+    container_name: weops-mysql
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: production
+      MYSQL_USER: readonly_user
+      MYSQL_PASSWORD: readonly_pass
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: weops-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+volumes:
+  redis_data:
+    driver: local
+  mysql_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
