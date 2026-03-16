@@ -66,8 +66,6 @@ def _load_prompt() -> str:
 
 def _get_agent(console_confirm_mode: bool = True) -> Any:
     """获取 Recovery Subagent 编译实例（按确认模式分别缓存，线程安全）"""
-    if console_confirm_mode in _agent_cache:
-        return _agent_cache[console_confirm_mode]
     with _cache_lock:
         if console_confirm_mode not in _agent_cache:
             logger.info(
@@ -97,7 +95,7 @@ def _get_agent(console_confirm_mode: bool = True) -> Any:
                 checkpointer=_checkpointer,
                 name="recovery_agent",
             )
-    return _agent_cache[console_confirm_mode]
+        return _agent_cache[console_confirm_mode]
 
 
 def purge_thread(thread_id: str) -> None:

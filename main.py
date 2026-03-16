@@ -19,12 +19,15 @@ import argparse
 import logging
 import sys
 
-# 配置日志
+from core.context import CorrelationIdFilter
+
+# 配置日志（格式含 correlation_id，由 CorrelationIdFilter 注入）
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s %(levelname)s [%(correlation_id)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logging.getLogger().addFilter(CorrelationIdFilter())
 logger = logging.getLogger(__name__)
 
 

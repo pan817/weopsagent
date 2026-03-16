@@ -52,8 +52,6 @@ def _load_prompt() -> str:
 def _get_agent() -> Any:
     """获取 Notification Subagent 编译实例（进程级单例，线程安全）"""
     global _agent
-    if _agent is not None:
-        return _agent
     with _agent_lock:
         if _agent is None:
             logger.info("[NotificationAgent] 编译 Notification Subagent（首次初始化）")
@@ -78,7 +76,7 @@ def _get_agent() -> Any:
                 checkpointer=_checkpointer,
                 name="notification_agent",
             )
-    return _agent
+        return _agent
 
 
 def purge_thread(thread_id: str) -> None:

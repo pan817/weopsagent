@@ -19,6 +19,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolMessage
 
 from config.settings import settings
+from core.context import CorrelationIdFilter, get_correlation_id
 
 # 审计日志使用独立的 logger
 audit_logger = logging.getLogger("weops.audit")
@@ -29,6 +30,7 @@ def _setup_audit_logger():
     if audit_logger.handlers:
         return
     audit_logger.setLevel(logging.INFO)
+    audit_logger.addFilter(CorrelationIdFilter())
 
     log_path = Path(settings.audit_log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,7 +39,7 @@ def _setup_audit_logger():
     file_handler.setLevel(logging.INFO)
 
     formatter = logging.Formatter(
-        fmt='%(asctime)s | %(levelname)s | %(message)s',
+        fmt='%(asctime)s | %(levelname)s | [%(correlation_id)s] | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
     )
     file_handler.setFormatter(formatter)
@@ -79,7 +81,12 @@ class AuditLogMiddleware(AgentMiddleware):
 
     def _log(self, level: str, event: str, **kwargs):
         """统一结构化日志输出"""
-        record = {"fault_id": self.fault_id, "event": event, **kwargs}
+        record = {
+            "correlation_id": get_correlation_id() or "-",
+            "fault_id": self.fault_id,
+            "event": event,
+            **kwargs,
+        }
         msg = json.dumps(record, ensure_ascii=False, default=str)
         getattr(audit_logger, level.lower())(msg)
 

@@ -32,6 +32,7 @@ from agents.recovery_agent import run_recovery, set_console_confirm_mode
 from agents.recovery_agent import purge_thread as recovery_purge_thread
 from agents.notification_agent import run_notification
 from agents.notification_agent import purge_thread as notification_purge_thread
+from core.context import get_correlation_id, new_correlation_id
 from llm.model import get_llm
 from memory.memory_manager import get_memory_manager
 from middleware.audit_log import AuditLogMiddleware
@@ -171,6 +172,10 @@ class FaultAgent:
         fault_id = fault_id or f"FAULT-{ts}"
         session_id = session_id or fault_id
         start_time = time.time()
+
+        # CLI 模式下 API 层未设置 correlation_id，自动生成保证全链路可追踪
+        if not get_correlation_id():
+            new_correlation_id()
 
         logger.info(f"[FaultAgent] 开始处理故障 fault_id={fault_id}")
 

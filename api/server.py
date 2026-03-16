@@ -22,10 +22,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
 from config.settings import settings
+from core.context import get_correlation_id, new_correlation_id, set_correlation_id
 
 logger = logging.getLogger(__name__)
+
+
+# ===== Correlation ID 中间件 =====
+
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    """
+    从请求头 X-Request-ID 读取 correlation_id（或自动生成），
+    写入 ContextVar 供整条调用链使用，并在响应头中回传。
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        cid = request.headers.get("X-Request-ID") or new_correlation_id()
+        set_correlation_id(cid)
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = cid
+        return response
+
 
 # ===== 认证机制 =====
 
@@ -203,6 +223,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# Correlation ID（最外层，先于 CORS 执行）
+app.add_middleware(CorrelationIdMiddleware)
 
 # 跨域配置（从环境变量读取允许的来源）
 _cors_origins = [
