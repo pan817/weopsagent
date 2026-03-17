@@ -12,9 +12,11 @@ system prompt 引导标准工作流程。
     ├── run_recovery     → RecoveryAgent (子Agent，含危险操作 + 人工确认)
     └── run_notification → NotificationAgent (子Agent，通知发送)
 """
+import atexit
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -22,7 +24,7 @@ from typing import Any, Dict, Optional
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.memory import InMemorySaver
+from memory.bounded_saver import BoundedInMemorySaver
 
 from agents.monitor_agent import run_monitoring
 from agents.monitor_agent import purge_thread as monitor_purge_thread
@@ -32,6 +34,7 @@ from agents.recovery_agent import run_recovery, set_console_confirm_mode
 from agents.recovery_agent import purge_thread as recovery_purge_thread
 from agents.notification_agent import run_notification
 from agents.notification_agent import purge_thread as notification_purge_thread
+from config.settings import settings
 from core.context import get_correlation_id, new_correlation_id
 from llm.model import get_llm
 from memory.memory_manager import get_memory_manager
@@ -86,25 +89,42 @@ class FaultAgent:
         self.planner = FaultPlanner()
         self.memory_manager = get_memory_manager()
 
-        # 构建主 Agent（checkpointer=InMemorySaver 自动管理对话历史）
-        self._checkpointer = InMemorySaver()
+        # 构建主 Agent（checkpointer=BoundedInMemorySaver 自动管理对话历史）
+        self._checkpointer = BoundedInMemorySaver(
+            max_threads=settings.checkpointer_max_threads,
+            ttl_seconds=settings.checkpointer_ttl_seconds,
+        )
         self._agent = self._build_agent()
 
         # 跟踪活跃会话 {session_id: last_active_timestamp}（线程安全）
         self._active_sessions: Dict[str, float] = {}
         self._sessions_lock = threading.Lock()
-        # 会话过期时间（秒），默认 2 小时
-        self._session_ttl: float = 7200.0
-        # 最大会话数量，超过时清理最旧的会话
-        self._max_sessions: int = 200
+        # 会话过期时间与最大会话数量（与 checkpointer TTL 对齐）
+        self._session_ttl: float = float(settings.checkpointer_ttl_seconds)
+        self._max_sessions: int = settings.checkpointer_max_threads * 2
+
+        # 线程池：用于受控的异步 purge 任务（替代裸 daemon 线程）
+        self._cleanup_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="fa-cleanup"
+        )
+
+        # 周期清理定时器（每 checkpointer_cleanup_interval 秒触发一次）
+        self._stop_event = threading.Event()
+        self._cleanup_thread = threading.Thread(
+            target=self._run_cleanup_loop,
+            name="fa-periodic-cleanup",
+            daemon=False,
+        )
+        self._cleanup_thread.start()
+
+        # 进程退出时优雅关闭（确保 purge 任务完成）
+        atexit.register(self._shutdown)
 
         self._init_knowledge_base()
         logger.info("[FaultAgent] 主 Agent 初始化完成")
 
     def _build_agent(self) -> Any:
         """构建主 Agent（create_agent + 子 Agent 工具 + 中间件）"""
-        from config.settings import settings
-
         middleware = [ToolInputFixMiddleware()]
         if self.enable_audit_log:
             middleware.append(AuditLogMiddleware())
@@ -289,30 +309,22 @@ class FaultAgent:
         logger.info(f"[FaultAgent] 已清除会话 {session_id}")
 
     def _purge_checkpointer_thread(self, thread_id: str) -> None:
-        """从主 Agent 和所有子 Agent 的 InMemorySaver 中删除指定 thread 的检查点数据"""
-        # 清理主 Agent checkpointer
+        """从主 Agent 和所有子 Agent 的 BoundedInMemorySaver 中删除指定 thread 的检查点数据"""
         try:
-            storage = getattr(self._checkpointer, "storage", None)
-            if storage is not None and isinstance(storage, dict):
-                keys_to_remove = [
-                    k for k in storage if k[0] == thread_id
-                ]
-                for k in keys_to_remove:
-                    del storage[k]
+            self._checkpointer.purge(thread_id)
         except Exception as e:
             logger.debug(f"[FaultAgent] 清理主 Agent checkpointer 失败: {e}")
 
-        # 清理所有子 Agent 的 checkpointer（子 Agent 以 fault_id 作为 thread_id）
-        for purge_fn in (
-            monitor_purge_thread,
-            analysis_purge_thread,
-            recovery_purge_thread,
-            notification_purge_thread,
+        for name, purge_fn in (
+            ("MonitorAgent", monitor_purge_thread),
+            ("AnalysisAgent", analysis_purge_thread),
+            ("RecoveryAgent", recovery_purge_thread),
+            ("NotificationAgent", notification_purge_thread),
         ):
             try:
                 purge_fn(thread_id)
             except Exception as e:
-                logger.debug(f"[FaultAgent] 清理子 Agent checkpointer 失败: {e}")
+                logger.debug(f"[FaultAgent] 清理 {name} checkpointer 失败: {e}")
 
     def _cleanup_expired_sessions(self) -> None:
         """清理过期会话（需在 _sessions_lock 内调用）"""
@@ -323,14 +335,7 @@ class FaultAgent:
         ]
         for sid in expired:
             del self._active_sessions[sid]
-            # 异步清理 checkpointer 避免在锁内做 IO
-            threading.Thread(
-                target=self._purge_checkpointer_thread,
-                args=(sid,),
-                daemon=True,
-            ).start()
 
-        # 如果超过最大会话数，移除最旧的
         if len(self._active_sessions) > self._max_sessions:
             sorted_sessions = sorted(
                 self._active_sessions.items(), key=lambda x: x[1]
@@ -338,11 +343,72 @@ class FaultAgent:
             excess = len(self._active_sessions) - self._max_sessions
             for sid, _ in sorted_sessions[:excess]:
                 del self._active_sessions[sid]
-                threading.Thread(
-                    target=self._purge_checkpointer_thread,
-                    args=(sid,),
-                    daemon=True,
-                ).start()
+                expired.append(sid)
+
+        # 提交到线程池（可追踪，非 daemon 线程）
+        for sid in expired:
+            self._cleanup_executor.submit(self._purge_checkpointer_thread, sid)
+
+    def _run_cleanup_loop(self) -> None:
+        """周期清理循环，每 checkpointer_cleanup_interval 秒运行一次。
+
+        以 5s 为粒度轮询 _stop_event，确保 _shutdown() 调用后
+        线程在 5s 内退出，而不是阻塞整个 interval（最长 1800s）。
+        """
+        interval = float(settings.checkpointer_cleanup_interval)
+        logger.info(f"[FaultAgent] 周期清理定时器启动，间隔 {interval}s")
+        elapsed = 0.0
+        _POLL = 5.0  # 检查粒度（秒）
+        while not self._stop_event.is_set():
+            self._stop_event.wait(timeout=_POLL)
+            if self._stop_event.is_set():
+                break
+            elapsed += _POLL
+            if elapsed >= interval:
+                self._run_periodic_cleanup()
+                elapsed = 0.0
+        logger.info("[FaultAgent] 周期清理定时器已停止")
+
+    def _run_periodic_cleanup(self) -> None:
+        """周期清理：驱逐过期 session + 所有子 Agent checkpointer 的过期 thread"""
+        try:
+            with self._sessions_lock:
+                self._cleanup_expired_sessions()
+
+            # 驱逐子 Agent checkpointer 中超 TTL 的 thread（兜底，不依赖 session 跟踪）
+            from agents import monitor_agent, analysis_agent, recovery_agent, notification_agent
+            ttl = float(settings.checkpointer_ttl_seconds)
+            for mod_name, mod in (
+                ("monitor", monitor_agent),
+                ("analysis", analysis_agent),
+                ("recovery", recovery_agent),
+                ("notification", notification_agent),
+            ):
+                try:
+                    cp = getattr(mod, "_checkpointer", None)
+                    if cp is not None:
+                        n = cp.purge_expired(ttl)
+                        if n:
+                            logger.debug(f"[FaultAgent] 周期清理 {mod_name}_agent 驱逐 {n} 个过期 thread")
+                except Exception as e:
+                    logger.debug(f"[FaultAgent] 周期清理 {mod_name}_agent 失败: {e}")
+
+            # 主 checkpointer 也清理一次
+            n = self._checkpointer.purge_expired(ttl)
+            stats = self._checkpointer.stats()
+            logger.info(
+                f"[FaultAgent] 周期清理完成 主checkpointer={stats} 主驱逐={n}"
+            )
+        except Exception as e:
+            logger.warning(f"[FaultAgent] 周期清理异常: {e}")
+
+    def _shutdown(self) -> None:
+        """优雅关闭：停止定时器，等待所有 purge 任务完成"""
+        logger.info("[FaultAgent] 正在关闭，等待清理任务完成...")
+        self._stop_event.set()
+        self._cleanup_thread.join(timeout=10)
+        self._cleanup_executor.shutdown(wait=True, cancel_futures=False)
+        logger.info("[FaultAgent] 已关闭")
 
     def _build_prompt(
         self,

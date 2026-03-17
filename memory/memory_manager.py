@@ -12,13 +12,24 @@
   search(query, service, alert_type) -> str   # 返回格式化的知识库上下文
   store_async(knowledge_data)                 # 触发后台写入
 """
+import atexit
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# 模块级写入线程池（store + hit-update 共用）
+# max_workers=4：Judge 调用 LLM 耗时长，4 个并发足够
+# atexit 确保进程退出时等待所有在途写入完成（覆盖 sys.exit / SIGTERM via lifespan）
+_write_executor = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="mm-write",
+)
+atexit.register(_write_executor.shutdown, wait=True)
 
 
 class MemoryManager:
@@ -104,17 +115,14 @@ class MemoryManager:
           service (optional), alert_type (optional),
           tags (list), effectiveness, category
         """
-        t = threading.Thread(
-            target=self._store_pipeline,
-            args=(knowledge_data,),
-            daemon=True,
-            name=f"memory-store-{knowledge_data.get('doc_id', '')[:8]}",
+        doc_id_short = knowledge_data.get("doc_id", "")[:8]
+        future = _write_executor.submit(self._store_pipeline, knowledge_data)
+        future.add_done_callback(
+            lambda f: logger.error(
+                f"[MemoryManager] 后台存储异常 doc_id={doc_id_short}: {f.exception()}"
+            ) if f.exception() else None
         )
-        t.start()
-        logger.debug(
-            f"[MemoryManager] 已触发异步存储 "
-            f"doc_id={knowledge_data.get('doc_id', '')[:8]}"
-        )
+        logger.debug(f"[MemoryManager] 已触发异步存储 doc_id={doc_id_short}")
 
     def _store_pipeline(self, data: Dict) -> None:
         """后台线程执行：Judge → ES → Redis"""
@@ -180,7 +188,7 @@ class MemoryManager:
                 if self._cache.is_available and service:
                     self._cache.increment_hit(doc_id, service, alert_type or "")
 
-        threading.Thread(target=_update, daemon=True).start()
+        _write_executor.submit(_update)
 
     @staticmethod
     def _doc_to_cache(data: Dict) -> Dict:

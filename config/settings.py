@@ -169,6 +169,20 @@ class Settings(BaseSettings):
     memory_es_index: str = Field(default="weops_knowledge", description="Elasticsearch 索引名")
     memory_es_score_threshold: float = Field(default=0.6, description="ES 检索相关度阈值，低于此值降级到 L3")
 
+    # ===== Checkpointer =====
+    checkpointer_max_threads: int = Field(
+        default=100,
+        description="每个 InMemorySaver 最多保留多少个 thread 的 checkpoint（LRU 驱逐）",
+    )
+    checkpointer_ttl_seconds: int = Field(
+        default=7200,
+        description="Checkpointer TTL（秒），超过此时间未写入的 thread 在周期清理时被驱逐",
+    )
+    checkpointer_cleanup_interval: int = Field(
+        default=1800,
+        description="Checkpointer 周期清理间隔（秒），默认 30 分钟",
+    )
+
     # ===== Tool Safety =====
     restart_blacklist_hosts: str = Field(default="", description="禁止重启的主机，逗号分隔")
     tool_max_retries: int = Field(default=3)

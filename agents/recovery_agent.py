@@ -23,10 +23,10 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, Field
 
 from config.settings import settings
+from memory.bounded_saver import BoundedInMemorySaver
 from llm.model import get_llm
 from middleware.audit_log import AuditLogMiddleware
 from middleware.human_confirm import HumanConfirmMiddleware
@@ -44,7 +44,10 @@ _agent_cache: Dict[bool, Any] = {}
 _cache_lock = threading.Lock()
 # 模块级 checkpointer，按 fault_id 隔离会话，支持外部清理
 # 所有 confirm_mode 的 agent 共享同一个 checkpointer
-_checkpointer = InMemorySaver()
+_checkpointer = BoundedInMemorySaver(
+    max_threads=settings.checkpointer_max_threads,
+    ttl_seconds=settings.checkpointer_ttl_seconds,
+)
 
 # 当前 console_confirm_mode 设置（由 FaultAgent 初始化时设置）
 _console_confirm_mode: bool = True
@@ -101,11 +104,7 @@ def _get_agent(console_confirm_mode: bool = True) -> Any:
 def purge_thread(thread_id: str) -> None:
     """清理指定 fault_id 对应的 checkpointer 数据，由 FaultAgent 在会话清理时调用"""
     try:
-        storage = getattr(_checkpointer, "storage", None)
-        if storage is not None and isinstance(storage, dict):
-            keys_to_remove = [k for k in storage if k[0] == thread_id]
-            for k in keys_to_remove:
-                del storage[k]
+        _checkpointer.purge(thread_id)
     except Exception as e:
         logger.debug(f"[RecoveryAgent] 清理 checkpointer 失败: {e}")
 

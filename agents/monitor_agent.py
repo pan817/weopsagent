@@ -21,11 +21,11 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, Field
 
 from config.settings import settings
 from llm.model import get_sequential_llm
+from memory.bounded_saver import BoundedInMemorySaver
 from middleware.audit_log import AuditLogMiddleware
 from middleware.sliding_window import SlidingWindowMiddleware
 from middleware.summarization import SummarizationMiddleware
@@ -40,7 +40,10 @@ MONITOR_TOOLS = get_tool_registry().get_group("monitor")
 _agent: Any = None
 _agent_lock = threading.Lock()
 # 模块级 checkpointer，按 fault_id 隔离会话，支持外部清理
-_checkpointer = InMemorySaver()
+_checkpointer = BoundedInMemorySaver(
+    max_threads=settings.checkpointer_max_threads,
+    ttl_seconds=settings.checkpointer_ttl_seconds,
+)
 
 
 def _load_prompt() -> str:
@@ -82,11 +85,7 @@ def _get_agent() -> Any:
 def purge_thread(thread_id: str) -> None:
     """清理指定 fault_id 对应的 checkpointer 数据，由 FaultAgent 在会话清理时调用"""
     try:
-        storage = getattr(_checkpointer, "storage", None)
-        if storage is not None and isinstance(storage, dict):
-            keys_to_remove = [k for k in storage if k[0] == thread_id]
-            for k in keys_to_remove:
-                del storage[k]
+        _checkpointer.purge(thread_id)
     except Exception as e:
         logger.debug(f"[MonitorAgent] 清理 checkpointer 失败: {e}")
 

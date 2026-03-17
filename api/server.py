@@ -206,13 +206,23 @@ async def lifespan(app: FastAPI):
     """应用启动/关闭生命周期钩子"""
     logger.info("[API] WeOps Agent 服务启动中...")
     # 预热初始化
+    agent = None
     try:
         agent = get_fault_agent()
         logger.info("[API] 服务启动完成，Agent 已就绪")
     except Exception as e:
         logger.error(f"[API] Agent 初始化失败（服务仍将启动）: {e}")
+
     yield
+
+    # Uvicorn 将 SIGTERM 转为 lifespan 关闭事件，在此触发优雅关闭。
+    # 与 atexit 双保险：覆盖 docker stop / kubectl delete pod 等容器化场景。
     logger.info("[API] WeOps Agent 服务正在关闭...")
+    if agent is not None:
+        try:
+            agent._shutdown()
+        except Exception as e:
+            logger.warning(f"[API] Agent 关闭异常: {e}")
 
 
 # ===== FastAPI 应用 =====
